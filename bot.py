@@ -275,14 +275,17 @@ def slug_from_url(post_url):
 
 
 def fetch_post(base_url, post_url):
-    """Busca título + HTML completo de um post via API pública do Substack
-    (usada pelo próprio frontend), com fallback pra raspar a página HTML
-    direto se a API não retornar o esperado. Mora em bot.py (não em
-    index_articles.py, de onde foi movida) porque agora também é usada pelo
-    chat pra buscar sob demanda o artigo completo quando alguém pede pra
-    receber um post que ainda não está em article_content.json (ver
-    _fetch_article_html_on_demand). Devolve o HTML bruto — quem indexa
-    (index_articles.py) que decide extrair só o texto puro."""
+    """Busca título + HTML completo + capa de um post via API pública do
+    Substack (usada pelo próprio frontend), com fallback pra raspar a
+    página HTML direto se a API não retornar o esperado. Mora em bot.py
+    (não em index_articles.py, de onde foi movida) porque agora também é
+    usada pelo chat pra buscar sob demanda o artigo completo quando alguém
+    pede pra receber um post que ainda não está em article_content.json
+    (ver _fetch_article_html_on_demand). Devolve o HTML bruto — quem indexa
+    (index_articles.py) que decide extrair só o texto puro. Retorna
+    (título, html, url_da_capa) — url_da_capa é "" quando cai no fallback
+    de raspagem (a API não estruturada não tem um campo equivalente fácil
+    de achar sem duplicar a lógica de extração de imagem do corpo)."""
     slug = slug_from_url(post_url)
     api_url = f"{base_url}/api/v1/posts/{slug}"
     try:
@@ -292,7 +295,7 @@ def fetch_post(base_url, post_url):
         title = data.get("title", "")
         body_html = data.get("body_html") or ""
         if title and body_html:
-            return title, body_html
+            return title, body_html, data.get("cover_image") or ""
     except Exception as exc:
         print(f"Aviso: API falhou pra {post_url} ({exc}); tentando HTML direto.", file=sys.stderr)
 
@@ -306,7 +309,7 @@ def fetch_post(base_url, post_url):
         re.IGNORECASE | re.DOTALL,
     )
     body_html = body_match.group(1) if body_match else html_page
-    return title, body_html
+    return title, body_html, ""
 
 
 # ---------------------------------------------------------------------------
@@ -827,7 +830,7 @@ def _fetch_article_html_on_demand(article):
     ele ainda não está em article_content.json (só entram lá os artigos
     publicados automaticamente depois que essa funcionalidade passou a
     existir; os demais 121 precisam ser buscados na hora)."""
-    title, body_html = fetch_post(substack_base_url(), article["url"])
+    title, body_html, _cover_image = fetch_post(substack_base_url(), article["url"])
     return rich_message.build_full_article_html(title=title, link=article["url"], raw_body_html=body_html)
 
 

@@ -40,15 +40,25 @@ class RateLimitedEmbedTest(unittest.TestCase):
 class BuildArticlesCatalogTest(unittest.TestCase):
     def test_deduplicates_by_url_and_sorts_by_title(self):
         index = [
-            {"url": "https://x.com/p/b", "titulo": "Beta", "texto": "...", "embedding": [1]},
-            {"url": "https://x.com/p/b", "titulo": "Beta", "texto": "...(chunk 2)", "embedding": [2]},
-            {"url": "https://x.com/p/a", "titulo": "Alfa", "texto": "...", "embedding": [3]},
+            {"url": "https://x.com/p/b", "titulo": "Beta", "capa": "https://x.com/b.jpg", "texto": "...", "embedding": [1]},
+            {"url": "https://x.com/p/b", "titulo": "Beta", "capa": "https://x.com/b.jpg", "texto": "...(chunk 2)", "embedding": [2]},
+            {"url": "https://x.com/p/a", "titulo": "Alfa", "capa": "https://x.com/a.jpg", "texto": "...", "embedding": [3]},
         ]
         catalog = index_articles.build_articles_catalog(index)
         self.assertEqual(catalog, [
-            {"titulo": "Alfa", "url": "https://x.com/p/a"},
-            {"titulo": "Beta", "url": "https://x.com/p/b"},
+            {"titulo": "Alfa", "url": "https://x.com/p/a", "capa": "https://x.com/a.jpg"},
+            {"titulo": "Beta", "url": "https://x.com/p/b", "capa": "https://x.com/b.jpg"},
         ])
+
+    def test_missing_capa_defaults_to_empty_string(self):
+        index = [{"url": "https://x.com/p/a", "titulo": "Alfa", "texto": "...", "embedding": [1]}]
+        catalog = index_articles.build_articles_catalog(index)
+        self.assertEqual(catalog, [{"titulo": "Alfa", "url": "https://x.com/p/a", "capa": ""}])
+
+    def test_strips_stray_whitespace_from_title(self):
+        index = [{"url": "https://x.com/p/a", "titulo": "  Alfa Com Espaço  ", "texto": "...", "embedding": [1]}]
+        catalog = index_articles.build_articles_catalog(index)
+        self.assertEqual(catalog[0]["titulo"], "Alfa Com Espaço")
 
     def test_empty_index_returns_empty_catalog(self):
         self.assertEqual(index_articles.build_articles_catalog([]), [])

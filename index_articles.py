@@ -110,21 +110,24 @@ def already_indexed_urls(index):
 
 
 def build_articles_catalog(index):
-    """Deduplica o índice completo por URL e devolve só título+URL de cada
-    artigo, ordenado por título — o suficiente pra vitrine do Mini App."""
+    """Deduplica o índice completo por URL e devolve título+URL+capa de
+    cada artigo, ordenado por título — o suficiente pra vitrine do Mini
+    App. Chunks indexados antes do campo "capa" existir (ver index_article)
+    simplesmente não têm a chave — .get() cobre isso com "" (vitrine mostra
+    sem imagem nesse caso)."""
     seen = {}
     for chunk in index:
         url = chunk.get("url", "")
         if url and url not in seen:
-            seen[url] = chunk.get("titulo", "")
+            seen[url] = {"titulo": chunk.get("titulo", "").strip(), "capa": chunk.get("capa", "")}
     return sorted(
-        ({"titulo": titulo, "url": url} for url, titulo in seen.items()),
+        ({"titulo": info["titulo"], "url": url, "capa": info["capa"]} for url, info in seen.items()),
         key=lambda article: article["titulo"].lower(),
     )
 
 
 def index_article(base_url, post_url, embed_client):
-    title, body_html = fetch_post(base_url, post_url)
+    title, body_html, cover_image = fetch_post(base_url, post_url)
     full_text = strip_html(body_html)
     if not full_text:
         print(f"Aviso: artigo sem texto extraído, pulando: {post_url}", file=sys.stderr)
@@ -146,6 +149,7 @@ def index_article(base_url, post_url, embed_client):
             "id": f"{slug}#{i}",
             "titulo": title,
             "url": post_url,
+            "capa": cover_image,
             "texto": chunk,
             "embedding": embedding,
         }

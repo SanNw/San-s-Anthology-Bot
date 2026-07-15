@@ -563,12 +563,16 @@ class FetchPostTest(unittest.TestCase):
         self.assertEqual(bot.slug_from_url("https://x.substack.com/p/meu-slug/"), "meu-slug")
 
     def test_prefers_substack_api_when_available(self):
-        api_response = json.dumps({"title": "Título da API", "body_html": "<p>Corpo via API.</p>"}).encode()
+        api_response = json.dumps({
+            "title": "Título da API", "body_html": "<p>Corpo via API.</p>",
+            "cover_image": "https://substackcdn.com/capa.jpg",
+        }).encode()
         with patch.object(bot, "_fetch_raw", return_value=(api_response, "")) as mock_fetch:
-            title, body_html = bot.fetch_post("https://x.substack.com", "https://x.substack.com/p/meu-slug")
+            title, body_html, cover_image = bot.fetch_post("https://x.substack.com", "https://x.substack.com/p/meu-slug")
         mock_fetch.assert_called_once_with("https://x.substack.com/api/v1/posts/meu-slug")
         self.assertEqual(title, "Título da API")
         self.assertEqual(body_html, "<p>Corpo via API.</p>")
+        self.assertEqual(cover_image, "https://substackcdn.com/capa.jpg")
 
     def test_falls_back_to_scraping_html_page_when_api_fails(self):
         html_page = (
@@ -576,9 +580,10 @@ class FetchPostTest(unittest.TestCase):
             b'<div class="available-content"><p>Corpo raspado.</p></div></body></html>'
         )
         with patch.object(bot, "_fetch_raw", side_effect=[OSError("api fora do ar"), (html_page, "")]):
-            title, body_html = bot.fetch_post("https://x.substack.com", "https://x.substack.com/p/meu-slug")
+            title, body_html, cover_image = bot.fetch_post("https://x.substack.com", "https://x.substack.com/p/meu-slug")
         self.assertEqual(title, "Titulo da Pagina")
         self.assertIn("Corpo raspado.", body_html)
+        self.assertEqual(cover_image, "")
 
 
 class ExtractCitedArticleTest(unittest.TestCase):
@@ -648,7 +653,7 @@ class SendArticleToChatTest(unittest.TestCase):
 
     def test_fetches_on_demand_when_not_cached(self):
         with patch.object(bot, "load_article_content", return_value={}), \
-             patch.object(bot, "fetch_post", return_value=("Título", "<p>Corpo</p>")), \
+             patch.object(bot, "fetch_post", return_value=("Título", "<p>Corpo</p>", "")), \
              patch.object(bot, "substack_base_url", return_value="https://x.com"), \
              patch.object(bot, "send_rich_message") as mock_send_rich:
             bot.send_article_to_chat(555, self.ARTICLE)
@@ -969,6 +974,8 @@ class WebhookServerTest(unittest.TestCase):
         self.assertEqual(response.status, 200)
         self.assertIn("text/html", response.getheader("Content-Type"))
         self.assertIn(b"telegram-web-app.js", body)
+        self.assertIn(b"Noto+Serif", body)  # tipografia com suporte a diacriticos
+        self.assertIn(b"article-grid", body)  # vitrine com capa de artigo
 
     def test_get_miniapp_articles_serves_the_catalog(self):
         with patch.object(bot, "load_articles_catalog", return_value=[{"titulo": "T", "url": "https://x.com/p/t"}]):
