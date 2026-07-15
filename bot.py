@@ -1,7 +1,9 @@
 """Publica os artigos mais recentes de um feed RSS do Substack em um canal do Telegram
 e nos assinantes que interagiram com o bot no privado, além de responder a comandos."""
 
+import gzip
 import html
+import io
 import json
 import os
 import re
@@ -9,6 +11,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+import zlib
 from pathlib import Path
 
 import feedparser
@@ -39,9 +42,23 @@ IMG_SRC_RE = re.compile(r'<img[^>]+src=["\']([^"\']+)["\']', re.IGNORECASE)
 # às vezes carregam algum (colado de Word/Google Docs) e quebram o parser estrito.
 INVALID_XML_CHARS_RE = re.compile(rb"[\x00-\x08\x0B\x0C\x0E-\x1F]")
 
-# Mesmo User-Agent que o feedparser usa por padrão ao buscar URLs diretamente —
-# um User-Agent customizado levou o Substack a responder 403 Forbidden.
+# Mesmos headers que o feedparser usa por padrão ao buscar URLs diretamente.
+# Faltar Accept/Accept-encoding/A-IM (mesmo com o User-Agent certo) fez o
+# Substack responder 403 Forbidden a um pedido "genérico" demais.
 USER_AGENT = getattr(feedparser, "USER_AGENT", "feedparser/6.0.11 +https://github.com/kurtmckee/feedparser/")
+try:
+    from feedparser.http import ACCEPT_HEADER
+except ImportError:
+    ACCEPT_HEADER = (
+        "application/atom+xml,application/rdf+xml,application/rss+xml,"
+        "application/x-netcdf,application/xml;q=0.9,text/xml;q=0.2,*/*;q=0.1"
+    )
+FETCH_HEADERS = {
+    "User-Agent": USER_AGENT,
+    "Accept": ACCEPT_HEADER,
+    "Accept-encoding": "gzip, deflate",
+    "A-IM": "feed",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -135,12 +152,24 @@ def sanitize_xml_bytes(data):
     return INVALID_XML_CHARS_RE.sub(b"", data)
 
 
+def decompress_response(content, content_encoding):
+    """Descompacta o corpo da resposta se o servidor mandou gzip/deflate."""
+    content_encoding = (content_encoding or "").lower()
+    if "gzip" in content_encoding:
+        return gzip.GzipFile(fileobj=io.BytesIO(content)).read()
+    if "deflate" in content_encoding:
+        return zlib.decompress(content)
+    return content
+
+
 def fetch_feed(url):
-    """Busca o RSS manualmente (via urllib, como o próprio feedparser faz) e
-    sanitiza o XML antes de repassar pro feedparser."""
-    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    """Busca o RSS manualmente (via urllib, com os mesmos headers que o
+    feedparser usa) e sanitiza o XML antes de repassar pro feedparser."""
+    request = urllib.request.Request(url, headers=FETCH_HEADERS)
     with urllib.request.urlopen(request, timeout=30) as response:
         content = response.read()
+        content_encoding = response.headers.get("Content-Encoding", "")
+    content = decompress_response(content, content_encoding)
     return feedparser.parse(sanitize_xml_bytes(content))
 
 

@@ -1,7 +1,10 @@
 """Testes básicos das funções de parsing do bot (sem chamar a API do Telegram)."""
 
+import gzip
+import io
 import json
 import unittest
+import zlib
 from pathlib import Path
 from unittest.mock import patch
 
@@ -106,6 +109,25 @@ class SanitizeXmlBytesTest(unittest.TestCase):
     def test_keeps_newlines_and_tabs(self):
         raw = b"<title>linha 1\nlinha 2\tcom tab</title>"
         self.assertEqual(bot.sanitize_xml_bytes(raw), raw)
+
+
+class DecompressResponseTest(unittest.TestCase):
+    def test_decompresses_gzip(self):
+        raw = b"<rss>conteudo</rss>"
+        buf = io.BytesIO()
+        with gzip.GzipFile(fileobj=buf, mode="wb") as f:
+            f.write(raw)
+        self.assertEqual(bot.decompress_response(buf.getvalue(), "gzip"), raw)
+
+    def test_decompresses_deflate(self):
+        raw = b"<rss>conteudo</rss>"
+        compressed = zlib.compress(raw)
+        self.assertEqual(bot.decompress_response(compressed, "deflate"), raw)
+
+    def test_passes_through_uncompressed(self):
+        raw = b"<rss>conteudo</rss>"
+        self.assertEqual(bot.decompress_response(raw, ""), raw)
+        self.assertEqual(bot.decompress_response(raw, None), raw)
 
 
 class ExtractCategoriesTest(unittest.TestCase):
