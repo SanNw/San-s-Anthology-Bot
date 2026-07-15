@@ -183,17 +183,42 @@ def build_caption(entry):
     return caption
 
 
-def extract_categories(entries):
-    """Lista as categorias (tags) únicas presentes nas entries do feed, na ordem em que aparecem."""
-    categories = []
-    seen = set()
-    for entry in entries:
-        for tag in entry.get("tags") or []:
-            term = (tag.get("term") or "").strip()
-            if term and term.lower() not in seen:
-                seen.add(term.lower())
-                categories.append(term)
-    return categories
+# O RSS do Substack não traz tag nenhuma por post (os <category> do feed
+# vêm sempre vazios) — as categorias de verdade são "Topics" do Substack,
+# uma taxonomia à parte, gerenciada pelo autor, sem endpoint público
+# confiável pra listar (a API /api/v1/archive tem paginação inconsistente:
+# limit=50 na primeira página só devolveu 23 posts numa checagem manual).
+# Lista copiada direto da própria página de Topics do autor no Substack;
+# precisa ser atualizada aqui à mão se um tópico novo for criado lá.
+SUBSTACK_TOPICS = (
+    ("Alquimia", "alquimia"), ("Amor", "amor"), ("Animais", "animais"),
+    ("Arte", "arte"), ("Beleza", "beleza"), ("Belo", "belo"),
+    ("Buddhismo", "buddhismo"), ("Contos de Fadas", "contos-de-fadas"),
+    ("Contrainiciação", "contrainiciacao"), ("Cosmologia", "cosmologia"),
+    ("Cristianismo", "cristianismo"), ("Dança", "danca"),
+    ("Divina Providência", "divina-providencia"), ("Espiritualidade", "espiritualidade"),
+    ("Eternidade", "eternidade"), ("Filme", "filme"), ("Filosófia", "filosofia"),
+    ("Freud", "freud"), ("História", "historia"), ("Humildade", "humildade"),
+    ("IA", "ia"), ("Índios", "indios"), ("Indumentária", "indumentaria"),
+    ("Japão", "japao"), ("Justo", "justo"), ("Literatura", "literatura"),
+    ("Maquinismo", "maquinismo"), ("Metafísica", "metafisica"),
+    ("Misericórdia", "misericordia"), ("Mitologia", "mitologia"),
+    ("Mitos", "mitos-883"), ("mitos", "mitos"), ("Modernidade", "modernidade"),
+    ("Música", "musica"), ("Nobreza", "nobreza"), ("Ontologia", "ontologia"),
+    ("Oração", "oracao"), ("Oriente", "oriente"), ("Perdão", "perdao"),
+    ("Platão", "platao"), ("Pós morte", "pos-morte"),
+    ("Protestantismo", "protestantismo"), ("Psicanálise", "psicanalise"),
+    ("Psicologia Moderna", "psicologia-moderna"), ("Psicologismo", "psicologismo"),
+    ("Religião", "religiao"), ("Religiões do Mundo", "religioes-do-mundo"),
+    ("Sabedoria", "sabedoria"), ("Santidade", "santidade"),
+    ("Segunda Perfeição Espiritual", "segunda-perfeicao-espiritual"),
+    ("Simbolismo", "simbolismo"), ("Símbolos", "simbolos"), ("Sonho", "sonho"),
+    ("Tradição Chinesa", "tradicao-chinesa"), ("Tradição Indígena", "tradicao-indigena"),
+    ("Tradicional", "tradicional"), ("Verdade", "verdade"),
+    ("Vida Espiritual", "vida-espiritual"), ("Videogames", "videogames"),
+    ("Virtudes", "virtudes"), ("Vontade Divina", "vontade-divina"),
+    ("Xamanismo", "xamanismo"), ("Xintoísmo", "xintoismo"),
+)
 
 
 def entry_id(entry):
@@ -595,12 +620,24 @@ def build_sugestao_message():
     return "💡 Tem sugestão de assunto? Basta mandar aqui mesmo, é só me mandar uma mensagem!"
 
 
-def build_categories_message(entries):
-    categories = extract_categories(entries)
-    if not categories:
-        return "Nenhuma categoria encontrada no momento."
-    bullets = "\n".join(f"• {html.escape(c)}" for c in categories)
-    return f"📚 Categorias disponíveis:\n\n{bullets}"
+def build_categories_messages():
+    """Uma ou mais mensagens com a lista de categorias (cada uma linkando
+    pra página do tópico no Substack) — a lista completa com link passa do
+    limite de 4096 caracteres do sendMessage, então divide em pedaços de
+    até TELEGRAM_TEXT_MAX_LENGTH em vez de truncar e perder categoria."""
+    substack_base = substack_base_url()
+    header = "📚 Categorias disponíveis:\n\n"
+    messages = []
+    current = header
+    for nome, slug in SUBSTACK_TOPICS:
+        bullet = f'• <a href="{substack_base}/t/{slug}">{html.escape(nome)}</a>\n'
+        if len(current) + len(bullet) > TELEGRAM_TEXT_MAX_LENGTH:
+            messages.append(current.rstrip())
+            current = ""
+        current += bullet
+    if current.strip():
+        messages.append(current.rstrip())
+    return messages
 
 
 def build_recent_articles_message(entries, count=RECENT_ARTICLES_COUNT):
@@ -1014,7 +1051,8 @@ def dispatch_message(message, bot_id, bot_username, feed_entries):
         save_subscribers(subscribers)
         send_telegram_message(chat_id, build_stop_message())
     elif command == "/categorias":
-        send_telegram_message(chat_id, build_categories_message(feed_entries))
+        for categories_message in build_categories_messages():
+            send_telegram_message(chat_id, categories_message)
     elif command == "/recentes":
         send_telegram_message(chat_id, build_recent_articles_message(feed_entries))
     elif command == "/substack":

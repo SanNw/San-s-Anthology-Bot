@@ -73,12 +73,14 @@ Testar localmente exige HTTPS e abrir de dentro do Telegram de verdade (o Mini A
 |---|---|
 | `/start` | Inscreve o usuário para receber os artigos novos no privado |
 | `/stop` | Cancela a inscrição |
-| `/categorias` | Lista as categorias/tags encontradas nos artigos do feed |
+| `/categorias` | Lista os Topics do Substack, cada um linkando pra página do tópico |
 | `/recentes` | Lista os 5 artigos mais recentes com link |
 | `/substack` | Envia o link para assinar o Substack |
 | `/sugestao` | Avisa que sugestões de assunto podem ser mandadas diretamente numa mensagem |
 
 O bot roda como um processo contínuo (Background Worker no Render) e fica em long polling com o Telegram — comandos e respostas do chat chegam quase instantaneamente. O feed RSS é reconsultado a cada `FEED_CHECK_INTERVAL_SECONDS` (padrão 300s = 5 min; veja a seção "Fazer deploy no Render").
+
+**Sobre `/categorias`**: o RSS do Substack não traz `<category>` nenhuma por post — as categorias de verdade são "Topics", uma taxonomia à parte gerenciada pelo autor (`/t/{slug}` no site), sem endpoint público confiável pra listar (a API não documentada `/api/v1/archive` tem paginação inconsistente). A lista fica hardcoded em `bot.SUBSTACK_TOPICS` — **se você criar um Topic novo no Substack, precisa adicionar aqui também** (nome + slug, copiado da URL `/t/{slug}` da página do tópico). A mensagem é dividida automaticamente em mais de uma (`build_categories_messages`) porque a lista completa com link passa do limite de 4096 caracteres do `sendMessage`.
 
 ## 1. Criar o bot no @BotFather
 

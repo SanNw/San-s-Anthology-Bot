@@ -3,6 +3,7 @@
 import gzip
 import hashlib
 import hmac
+import html
 import http.client
 import io
 import json
@@ -281,28 +282,28 @@ class FetchFeedTest(unittest.TestCase):
                 bot.fetch_feed("https://exemplo.substack.com/feed")
 
 
-class ExtractCategoriesTest(unittest.TestCase):
-    def test_returns_unique_categories_in_order(self):
-        entries = [
-            FakeEntry(tags=[{"term": "Filosofia"}, {"term": "Cultura"}]),
-            FakeEntry(tags=[{"term": "cultura"}, {"term": "Política"}]),
-            FakeEntry(tags=None),
-        ]
-        self.assertEqual(bot.extract_categories(entries), ["Filosofia", "Cultura", "Política"])
-
-    def test_returns_empty_list_when_no_tags(self):
-        self.assertEqual(bot.extract_categories([FakeEntry()]), [])
-
-
 class CommandMessageBuildersTest(unittest.TestCase):
-    def test_categories_message_lists_categories(self):
-        entries = [FakeEntry(tags=[{"term": "Filosofia"}])]
-        message = bot.build_categories_message(entries)
-        self.assertIn("Filosofia", message)
+    def test_categories_messages_list_topics_as_links(self):
+        messages = bot.build_categories_messages()
+        combined = "\n".join(messages)
+        nome, slug = bot.SUBSTACK_TOPICS[0]
+        self.assertIn(nome, combined)
+        self.assertIn(f"/t/{slug}", combined)
 
-    def test_categories_message_handles_empty(self):
-        message = bot.build_categories_message([])
-        self.assertIn("Nenhuma categoria", message)
+    def test_categories_messages_include_every_topic(self):
+        combined = "\n".join(bot.build_categories_messages())
+        for nome, _slug in bot.SUBSTACK_TOPICS:
+            self.assertIn(html.escape(nome), combined)
+
+    def test_categories_messages_each_stay_within_telegram_limit(self):
+        for message in bot.build_categories_messages():
+            self.assertLessEqual(len(message), bot.TELEGRAM_TEXT_MAX_LENGTH)
+
+    def test_categories_messages_split_into_more_than_one_when_too_long(self):
+        # A lista completa com link (63 categorias) passa do limite de uma
+        # mensagem só — bug real corrigido: antes vinha tudo numa string,
+        # e o sendMessage falhava (400, mensagem longa demais) sem avisar.
+        self.assertGreater(len(bot.build_categories_messages()), 1)
 
     def test_recent_articles_message_lists_titles_and_links(self):
         entries = [
