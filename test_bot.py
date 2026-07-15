@@ -93,6 +93,21 @@ class SubscribersJsonTest(unittest.TestCase):
             self.assertEqual(bot.load_subscribers(), set())
 
 
+class SanitizeXmlBytesTest(unittest.TestCase):
+    def test_strips_invalid_control_characters(self):
+        raw = b"<title>Ol\x0bA & B</title>"
+        cleaned = bot.sanitize_xml_bytes(raw)
+        self.assertEqual(cleaned, b"<title>OlA & B</title>")
+
+    def test_keeps_valid_bytes_untouched(self):
+        raw = "<title>Título válido, ç ã é</title>".encode("utf-8")
+        self.assertEqual(bot.sanitize_xml_bytes(raw), raw)
+
+    def test_keeps_newlines_and_tabs(self):
+        raw = b"<title>linha 1\nlinha 2\tcom tab</title>"
+        self.assertEqual(bot.sanitize_xml_bytes(raw), raw)
+
+
 class ExtractCategoriesTest(unittest.TestCase):
     def test_returns_unique_categories_in_order(self):
         entries = [
