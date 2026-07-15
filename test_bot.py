@@ -43,6 +43,29 @@ class TruncateSummaryTest(unittest.TestCase):
         self.assertTrue(result.endswith("..."))
 
 
+class MarkdownToTelegramHtmlTest(unittest.TestCase):
+    def test_converts_bold_italic_and_code(self):
+        result = bot.markdown_to_telegram_html("**negrito** e *itálico* e `código`")
+        self.assertEqual(result, "<b>negrito</b> e <i>itálico</i> e <code>código</code>")
+
+    def test_converts_header_to_bold(self):
+        result = bot.markdown_to_telegram_html("# Título\n\nTexto normal.")
+        self.assertEqual(result, "<b>Título</b>\n\nTexto normal.")
+
+    def test_converts_fenced_code_block(self):
+        result = bot.markdown_to_telegram_html("```\nprint(1)\n```")
+        self.assertEqual(result, "<pre>print(1)\n</pre>")
+
+    def test_escapes_html_special_chars_outside_markdown(self):
+        result = bot.markdown_to_telegram_html("Menos que <isso> & mais.")
+        self.assertEqual(result, "Menos que &lt;isso&gt; &amp; mais.")
+
+    def test_unmatched_marker_stays_literal_instead_of_broken_tag(self):
+        result = bot.markdown_to_telegram_html("Isso ficou **truncado no meio")
+        self.assertEqual(result, "Isso ficou **truncado no meio")
+        self.assertNotIn("<b>", result)
+
+
 class ExtractImageUrlTest(unittest.TestCase):
     def test_prefers_media_content(self):
         entry = FakeEntry(media_content=[{"url": "https://example.com/capa.jpg"}])
@@ -295,6 +318,21 @@ class ProcessUpdatesTest(unittest.TestCase):
         args, _ = mock_send.call_args
         self.assertIn("&lt;isso&gt;", args[1])
         self.assertIn("&amp;", args[1])
+
+    def test_chat_reply_converts_markdown_to_telegram_html(self):
+        updates = [{
+            "update_id": 4,
+            "message": {"message_id": 42, "chat": {"id": 555, "type": "private"}, "text": "pergunta"},
+        }]
+        mock_send, _ = self._run(
+            updates, should_respond=True,
+            rag_answer="**Título**\n\nUm ponto em *itálico* e `código`.",
+        )
+        args, _ = mock_send.call_args
+        self.assertIn("<b>Título</b>", args[1])
+        self.assertIn("<i>itálico</i>", args[1])
+        self.assertIn("<code>código</code>", args[1])
+        self.assertNotIn("**", args[1])
 
     def test_long_rag_answer_is_truncated_before_sending(self):
         long_answer = "palavra " * 1000  # bem acima do limite de envio do Telegram

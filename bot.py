@@ -467,6 +467,43 @@ def build_recent_articles_message(entries, count=RECENT_ARTICLES_COUNT):
 
 
 # ---------------------------------------------------------------------------
+# Formatação da resposta do RAG pro Telegram
+# ---------------------------------------------------------------------------
+# O Claude devolve a resposta em Markdown (**negrito**, *itálico*, `código`,
+# # títulos), mas o Telegram não entende Markdown nesse modo — ele é enviado
+# com parse_mode HTML (ver send_telegram_message). Convertemos aqui pras tags
+# que o Telegram suporta (https://core.telegram.org/bots/api#html-style) em
+# vez de simplesmente escapar tudo, o que deixava os marcadores (**texto**)
+# aparecendo literalmente na mensagem.
+
+CODE_BLOCK_RE = re.compile(r"```(?:\w*\n)?(.*?)```", re.DOTALL)
+INLINE_CODE_RE = re.compile(r"`([^`\n]+)`")
+HEADER_RE = re.compile(r"^#{1,6}[ \t]*(.+)$", re.MULTILINE)
+BOLD_RE = re.compile(r"\*\*(.+?)\*\*", re.DOTALL)
+ITALIC_RE = re.compile(r"(?<!\*)\*([^*\n]+?)\*(?!\*)")
+
+
+def markdown_to_telegram_html(text):
+    """Converte o Markdown básico da resposta do Claude para as tags HTML
+    que o Telegram entende. Escapa o texto primeiro (então & < > viram
+    entidades) e só depois substitui os marcadores de Markdown — que não são
+    caracteres especiais de HTML — pelas tags correspondentes. Marcadores sem
+    par (ex: truncados no meio por truncate_summary) ficam como texto literal
+    em vez de virar tag desbalanceada, porque as regexes exigem abertura E
+    fechamento."""
+    # quote=False: o Telegram só exige escapar &, < e > fora de tags; aspas e
+    # apóstrofos não precisam (e virariam &quot;/&#x27; literais na tela, já
+    # que o parser dele não promete decodificar entidades de aspas).
+    text = html.escape(text, quote=False)
+    text = CODE_BLOCK_RE.sub(lambda m: f"<pre>{m.group(1)}</pre>", text)
+    text = INLINE_CODE_RE.sub(lambda m: f"<code>{m.group(1)}</code>", text)
+    text = HEADER_RE.sub(lambda m: f"<b>{m.group(1)}</b>", text)
+    text = BOLD_RE.sub(lambda m: f"<b>{m.group(1)}</b>", text)
+    text = ITALIC_RE.sub(lambda m: f"<i>{m.group(1)}</i>", text)
+    return text
+
+
+# ---------------------------------------------------------------------------
 # Processamento de comandos recebidos (getUpdates)
 # ---------------------------------------------------------------------------
 
@@ -507,7 +544,7 @@ def handle_chat_message(message, bot_id, bot_username):
     try:
         send_telegram_message(
             chat_id,
-            html.escape(answer),
+            markdown_to_telegram_html(answer),
             reply_to_message_id=message.get("message_id"),
             message_thread_id=message.get("message_thread_id"),
         )
