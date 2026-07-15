@@ -5,6 +5,7 @@ de escopo (só responde com base no conteúdo indexado)."""
 import json
 import os
 import re
+import unicodedata
 from pathlib import Path
 
 import anthropic
@@ -280,15 +281,72 @@ def classify_send_intent(text, anthropic_client=None):
     return answer.startswith("ENVIAR")
 
 
+def _normalize_for_title_match(text):
+    """Tira acento, pontuação e caixa pra comparar título com o texto do
+    pedido sem depender de bater vírgula, ponto final ou maiúscula."""
+    text = unicodedata.normalize("NFKD", text or "").encode("ascii", "ignore").decode()
+    text = re.sub(r"[^\w\s]", "", text).lower().strip()
+    return re.sub(r"\s+", " ", text)
+
+
+# Abaixo disso, um título não entra na comparação por substring (só no
+# match exato) — evita que um título de uma palavra só vire falso positivo
+# por aparecer, por acaso, dentro de qualquer frase longa o bastante.
+MIN_TITLE_PARTIAL_MATCH_LENGTH = 8
+
+
+def _find_article_by_title(query_text, index):
+    """Match de título tem prioridade sobre a busca semântica — descoberto
+    depois de um bug real: um artigo chamado literalmente "A Realidade é
+    Tecida de Felicidade" e uma citação quase idêntica dentro de outro
+    artigo ("...a Realidade é tecida de felicidade...") competiam na busca
+    semântica, e ela escolhia a citação errada em vez do título exato que a
+    pessoa pediu. Título exato (normalizado) sempre ganha; um match parcial
+    só conta se for o único candidato (título curto demais colidindo com
+    vários artigos não deve arriscar escolher errado)."""
+    normalized_query = _normalize_for_title_match(query_text)
+    if not normalized_query:
+        return None
+
+    seen_urls = set()
+    partial_candidates = []
+    for chunk in index:
+        url = chunk.get("url", "")
+        if url in seen_urls:
+            continue
+        seen_urls.add(url)
+
+        titulo = chunk.get("titulo", "")
+        normalized_titulo = _normalize_for_title_match(titulo)
+        if not normalized_titulo:
+            continue
+        if normalized_titulo == normalized_query:
+            return {"titulo": titulo, "url": url}
+        # Títulos curtos demais (ex: uma palavra só) viram substring de
+        # praticamente qualquer frase — exige um tamanho mínimo antes de
+        # contar como candidato parcial, pra não dar falso positivo.
+        if len(normalized_titulo) >= MIN_TITLE_PARTIAL_MATCH_LENGTH and (
+            normalized_titulo in normalized_query or normalized_query in normalized_titulo
+        ):
+            partial_candidates.append({"titulo": titulo, "url": url})
+
+    return partial_candidates[0] if len(partial_candidates) == 1 else None
+
+
 def find_matching_article(query_text, index=None, voyage_client=None):
-    """Acha o artigo mais relevante pro texto (já sem a frase-gatilho) via a
-    mesma busca semântica do chat normal — não é um match de título exato,
-    é o mesmo LIMIAR_RELEVANCIA de sempre sobre o conteúdo inteiro. Retorna
-    {'titulo', 'url'} do melhor chunk, ou None se nada passar do limiar —
-    preserva a regra de nunca inventar um artigo que não existe."""
+    """Acha o artigo correspondente ao texto (já sem a frase-gatilho): tenta
+    primeiro um match de título (exato ou, se inequívoco, parcial); só cai
+    pra busca semântica de sempre se nada bater por título. Retorna
+    {'titulo', 'url'}, ou None se nada passar do LIMIAR_RELEVANCIA — preserva
+    a regra de nunca inventar um artigo que não existe."""
     index = load_articles_index() if index is None else index
     if not index or not query_text.strip():
         return None
+
+    title_match = _find_article_by_title(query_text, index)
+    if title_match:
+        return title_match
+
     scored_chunks = _relevant_chunks_or_none(query_text, index, voyage_client)
     if not scored_chunks:
         return None

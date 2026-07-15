@@ -272,6 +272,64 @@ class FindMatchingArticleTest(unittest.TestCase):
         self.assertIsNone(rag.find_matching_article("   ", index=[{"id": "a"}]))
         self.assertIsNone(rag.find_matching_article("algo", index=[]))
 
+    def test_exact_title_match_wins_over_semantic_search_of_a_quote(self):
+        # Bug real: um artigo com esse título exato e uma citação quase
+        # idêntica dentro de outro artigo competiam na busca semântica, que
+        # escolhia a citação errada. Título exato tem que ganhar sempre, sem
+        # nem precisar chamar o Voyage.
+        index = [
+            {
+                "id": "a-realidade#0", "titulo": "A Realidade é Tecida de Felicidade.",
+                "url": "https://san55.substack.com/p/a-realidade-e-tecida-de-felicidade",
+                "embedding": [0, 1],  # propositalmente "distante" pra provar que não foi a busca semântica
+            },
+            {
+                "id": "a-quietude#3", "titulo": "A Quietude e a Bem-Aventurança",
+                "url": "https://san55.substack.com/p/a-quietude-e-a-bem-aventuranca",
+                "embedding": [1, 0],  # "idêntico" ao embedding da pergunta abaixo
+            },
+        ]
+        fake_voyage = MagicMock()
+        fake_voyage.embed.return_value = MagicMock(embeddings=[[1, 0]])
+
+        result = rag.find_matching_article("A Realidade é Tecida de Felicidade", index=index, voyage_client=fake_voyage)
+
+        self.assertEqual(result, {
+            "titulo": "A Realidade é Tecida de Felicidade.",
+            "url": "https://san55.substack.com/p/a-realidade-e-tecida-de-felicidade",
+        })
+        fake_voyage.embed.assert_not_called()
+
+    def test_unambiguous_partial_title_match_also_wins(self):
+        index = [{
+            "id": "a", "titulo": "A Quietude e a Bem-Aventurança",
+            "url": "https://san55.substack.com/p/a-quietude", "embedding": [1, 0],
+        }]
+        fake_voyage = MagicMock()
+
+        result = rag.find_matching_article("me manda o artigo sobre A Quietude e a Bem-Aventurança, por favor", index=index, voyage_client=fake_voyage)
+
+        self.assertEqual(result, {"titulo": "A Quietude e a Bem-Aventurança", "url": "https://san55.substack.com/p/a-quietude"})
+        fake_voyage.embed.assert_not_called()
+
+    def test_ambiguous_partial_title_match_falls_back_to_semantic_search(self):
+        # "A Vida Boa" é substring de "A Vida Boa e a Morte Serena" e dos
+        # dois títulos normalizados dentro da pergunta (ambos com 8+
+        # caracteres, então passam do MIN_TITLE_PARTIAL_MATCH_LENGTH) — dois
+        # candidatos parciais, então não arrisca escolher errado e cai pra
+        # busca semântica de sempre.
+        index = [
+            {"id": "a", "titulo": "A Vida Boa", "url": "https://x.com/p/a", "embedding": [1, 0]},
+            {"id": "b", "titulo": "A Vida Boa e a Morte Serena", "url": "https://x.com/p/b", "embedding": [0, 1]},
+        ]
+        fake_voyage = MagicMock()
+        fake_voyage.embed.return_value = MagicMock(embeddings=[[0, 1]])  # favorece o artigo b
+
+        result = rag.find_matching_article("me manda o artigo sobre a vida boa e a morte serena", index=index, voyage_client=fake_voyage)
+
+        fake_voyage.embed.assert_called_once()
+        self.assertEqual(result, {"titulo": "A Vida Boa e a Morte Serena", "url": "https://x.com/p/b"})
+
 
 if __name__ == "__main__":
     unittest.main()
