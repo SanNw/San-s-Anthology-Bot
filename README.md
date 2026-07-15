@@ -37,8 +37,10 @@ cp .env.example .env
 ```env
 TELEGRAM_BOT_TOKEN=123456789:ABCdefGhIJKlmNoPQRsTUVwxyZ
 TELEGRAM_CHANNEL_ID=@meucanal
-SUBSTACK_RSS_URL=https://seudominio.substack.com/feed
+SUBSTACK_RSS_URL=https://san55.substack.com/feed
 ```
+
+> A URL do feed deste projeto é `https://san55.substack.com/feed`. Ela não é um dado sensível, mas ainda assim é cadastrada como Secret abaixo — só o token e o channel ID exigiriam sigilo, mas manter as três juntas como Secrets simplifica a configuração do Actions.
 
 O `.env` está no `.gitignore` — nunca é commitado.
 
@@ -67,9 +69,9 @@ Para funcionar, cadastre os três Secrets no repositório:
 
 1. No GitHub, vá em **Settings → Secrets and variables → Actions → New repository secret**.
 2. Crie:
-   - `TELEGRAM_BOT_TOKEN`
-   - `TELEGRAM_CHANNEL_ID`
-   - `SUBSTACK_RSS_URL`
+   - `TELEGRAM_BOT_TOKEN` (gerado pelo @BotFather)
+   - `TELEGRAM_CHANNEL_ID` (veja a seção 2 acima)
+   - `SUBSTACK_RSS_URL` → `https://san55.substack.com/feed`
 
 O workflow já está configurado com `permissions: contents: write` para poder commitar o `posted.json` atualizado de volta no repositório após cada execução, mantendo o histórico de artigos já publicados entre uma execução e outra.
 
