@@ -1,0 +1,6 @@
+.env
+posted.json
+subscribers.json
+update_offset.json
+__pycache__/
+.venv/
