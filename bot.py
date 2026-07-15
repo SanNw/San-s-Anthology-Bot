@@ -10,6 +10,7 @@ import re
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import zlib
 from pathlib import Path
@@ -59,6 +60,15 @@ FETCH_HEADERS = {
     "Accept-encoding": "gzip, deflate",
     "A-IM": "feed",
 }
+
+# Cloudflare (usado pelo Substack) bloqueia por reputação de IP/ASN os ranges
+# de datacenter das runners do GitHub Actions com 403, mesmo com headers
+# idênticos aos de um navegador (testado: proxies genéricos de CORS como
+# allorigins.win/codetabs/corsproxy.io são instáveis demais pra depender
+# sozinhos). Nesse caso específico, buscamos o mesmo feed via rss2json.com
+# (que faz a requisição a partir da própria infra dele) e adaptamos o JSON
+# pro mesmo formato de entries que o feedparser produziria.
+PROXY_FETCH_URL = "https://api.rss2json.com/v1/api.json?rss_url={url}"
 
 
 # ---------------------------------------------------------------------------
@@ -162,13 +172,51 @@ def decompress_response(content, content_encoding):
     return content
 
 
-def fetch_feed(url):
-    """Busca o RSS manualmente (via urllib, com os mesmos headers que o
-    feedparser usa) e sanitiza o XML antes de repassar pro feedparser."""
+def _fetch_raw(url):
     request = urllib.request.Request(url, headers=FETCH_HEADERS)
     with urllib.request.urlopen(request, timeout=30) as response:
-        content = response.read()
-        content_encoding = response.headers.get("Content-Encoding", "")
+        return response.read(), response.headers.get("Content-Encoding", "")
+
+
+def _proxy_item_to_entry(item):
+    """Converte um item do JSON do rss2json.com pro mesmo formato de entry
+    (campos acessados via .get) que o resto do código espera do feedparser."""
+    enclosure = item.get("enclosure") or {}
+    enclosures = []
+    if enclosure.get("link"):
+        enclosures.append({"href": enclosure["link"], "type": enclosure.get("type", "")})
+    return {
+        "title": item.get("title", ""),
+        "link": item.get("link", ""),
+        "id": item.get("guid") or item.get("link", ""),
+        "summary": item.get("description", ""),
+        "content": [{"value": item["content"]}] if item.get("content") else [],
+        "enclosures": enclosures,
+        "tags": [{"term": c} for c in item.get("categories") or []],
+    }
+
+
+def _fetch_via_proxy(url):
+    proxy_url = PROXY_FETCH_URL.format(url=urllib.parse.quote(url, safe=""))
+    content, content_encoding = _fetch_raw(proxy_url)
+    content = decompress_response(content, content_encoding)
+    data = json.loads(content)
+    entries = [_proxy_item_to_entry(item) for item in data.get("items") or []]
+    return feedparser.FeedParserDict(entries=entries, bozo=False)
+
+
+def fetch_feed(url):
+    """Busca o RSS manualmente (via urllib, com os mesmos headers que o
+    feedparser usa) e sanitiza o XML antes de repassar pro feedparser.
+
+    Se o Substack responder 403 (bloqueio de IP de datacenter, ver
+    PROXY_FETCH_URL acima), busca o mesmo feed através do proxy."""
+    try:
+        content, content_encoding = _fetch_raw(url)
+    except urllib.error.HTTPError as exc:
+        if exc.code != 403:
+            raise
+        return _fetch_via_proxy(url)
     content = decompress_response(content, content_encoding)
     return feedparser.parse(sanitize_xml_bytes(content))
 

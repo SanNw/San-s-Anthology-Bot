@@ -4,6 +4,7 @@ import gzip
 import io
 import json
 import unittest
+import urllib.error
 import zlib
 from pathlib import Path
 from unittest.mock import patch
@@ -128,6 +129,56 @@ class DecompressResponseTest(unittest.TestCase):
         raw = b"<rss>conteudo</rss>"
         self.assertEqual(bot.decompress_response(raw, ""), raw)
         self.assertEqual(bot.decompress_response(raw, None), raw)
+
+
+class FetchFeedTest(unittest.TestCase):
+    RSS = b"<rss><channel><title>Feed</title></channel></rss>"
+
+    def test_returns_feed_on_direct_success(self):
+        with patch.object(bot, "_fetch_raw", return_value=(self.RSS, "")) as mock_fetch:
+            feed = bot.fetch_feed("https://exemplo.substack.com/feed")
+        mock_fetch.assert_called_once_with("https://exemplo.substack.com/feed")
+        self.assertEqual(feed.channel.title, "Feed")
+
+    def test_falls_back_to_proxy_on_403(self):
+        forbidden = urllib.error.HTTPError("https://exemplo.substack.com/feed", 403, "Forbidden", {}, None)
+        proxy_json = json.dumps(
+            {
+                "items": [
+                    {
+                        "title": "Artigo via proxy",
+                        "link": "https://exemplo.substack.com/p/artigo",
+                        "guid": "https://exemplo.substack.com/p/artigo",
+                        "description": "Resumo",
+                        "content": "<p>Conteúdo completo</p>",
+                        "enclosure": {"link": "https://exemplo.com/capa.jpg", "type": "image/jpeg"},
+                        "categories": ["Filosofia"],
+                    }
+                ]
+            }
+        ).encode("utf-8")
+
+        def side_effect(url):
+            if "rss2json.com" in url:
+                return (proxy_json, "")
+            raise forbidden
+
+        with patch.object(bot, "_fetch_raw", side_effect=side_effect) as mock_fetch:
+            feed = bot.fetch_feed("https://exemplo.substack.com/feed")
+        self.assertEqual(mock_fetch.call_count, 2)
+        self.assertIn("rss2json.com", mock_fetch.call_args[0][0])
+        self.assertFalse(feed.bozo)
+        entry = feed.entries[0]
+        self.assertEqual(entry["title"], "Artigo via proxy")
+        self.assertEqual(entry["link"], "https://exemplo.substack.com/p/artigo")
+        self.assertEqual(entry["enclosures"][0]["href"], "https://exemplo.com/capa.jpg")
+        self.assertEqual(entry["tags"][0]["term"], "Filosofia")
+
+    def test_reraises_non_403_http_errors(self):
+        server_error = urllib.error.HTTPError("https://exemplo.substack.com/feed", 500, "Server Error", {}, None)
+        with patch.object(bot, "_fetch_raw", side_effect=server_error):
+            with self.assertRaises(urllib.error.HTTPError):
+                bot.fetch_feed("https://exemplo.substack.com/feed")
 
 
 class ExtractCategoriesTest(unittest.TestCase):
