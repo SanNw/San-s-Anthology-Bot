@@ -272,12 +272,16 @@ class ProcessUpdatesTest(unittest.TestCase):
         """Chat privado (o caso comum nesses testes) passa pelo caminho de
         streaming — rag.answer_question_stream + sendRichMessageDraft/
         sendRichMessage — então mocka os dois lados: o antigo (send_telegram_message,
-        pra comandos e pro caminho de grupo sem streaming) e o novo (send_rich_message)."""
+        pra comandos e pro caminho de grupo sem streaming) e o novo (send_rich_message).
+        classify_send_intent também é mockado como False (pergunta normal) por
+        padrão — sem isso, uma mensagem ambígua como "pergunta" (sem gatilho
+        de envio nem "?") cairia na chamada real ao Claude pra classificar."""
         with patch.object(bot, "SUBSCRIBERS_FILE", Path("test_subscribers_tmp.json")), \
              patch.object(bot, "OFFSET_FILE", Path("test_offset_tmp.json")), \
              patch.object(bot, "get_updates", return_value=updates), \
              patch.object(bot, "get_me", return_value=(999, "meubot")), \
              patch.object(bot.rag, "should_respond", return_value=should_respond), \
+             patch.object(bot.rag, "classify_send_intent", return_value=False), \
              patch.object(bot.rag, "answer_question", return_value=rag_answer), \
              patch.object(bot.rag, "answer_question_stream", return_value=iter([rag_answer])), \
              patch.object(bot, "send_rich_message_draft"), \
@@ -389,6 +393,7 @@ class ProcessUpdatesTest(unittest.TestCase):
              patch.object(bot, "get_updates", return_value=updates), \
              patch.object(bot, "get_me", return_value=(999, "meubot")), \
              patch.object(bot.rag, "should_respond", return_value=True), \
+             patch.object(bot.rag, "classify_send_intent", return_value=False), \
              patch.object(bot.rag, "answer_question_stream", return_value=iter(["resposta"])), \
              patch.object(bot, "send_rich_message", side_effect=requests.HTTPError("400 Client Error")), \
              patch.object(bot, "send_telegram_message"):
@@ -408,6 +413,7 @@ class ProcessUpdatesTest(unittest.TestCase):
              patch.object(bot, "get_updates", return_value=updates), \
              patch.object(bot, "get_me", return_value=(999, "meubot")), \
              patch.object(bot.rag, "should_respond", return_value=True), \
+             patch.object(bot.rag, "classify_send_intent", return_value=False), \
              patch.object(bot.rag, "answer_question_stream", side_effect=Exception("boom")), \
              patch.object(bot, "send_telegram_message") as mock_send:
             try:
@@ -488,6 +494,163 @@ class HandleCallbackQueryTest(unittest.TestCase):
             bot.handle_callback_query(self._callback("outra_coisa"))
         mock_rich.assert_not_called()
         mock_answer.assert_called_once_with("cbq1")
+
+
+class FetchPostTest(unittest.TestCase):
+    def test_slug_from_url_takes_last_path_segment(self):
+        self.assertEqual(bot.slug_from_url("https://x.substack.com/p/meu-slug"), "meu-slug")
+        self.assertEqual(bot.slug_from_url("https://x.substack.com/p/meu-slug/"), "meu-slug")
+
+    def test_prefers_substack_api_when_available(self):
+        api_response = json.dumps({"title": "Título da API", "body_html": "<p>Corpo via API.</p>"}).encode()
+        with patch.object(bot, "_fetch_raw", return_value=(api_response, "")) as mock_fetch:
+            title, body_html = bot.fetch_post("https://x.substack.com", "https://x.substack.com/p/meu-slug")
+        mock_fetch.assert_called_once_with("https://x.substack.com/api/v1/posts/meu-slug")
+        self.assertEqual(title, "Título da API")
+        self.assertEqual(body_html, "<p>Corpo via API.</p>")
+
+    def test_falls_back_to_scraping_html_page_when_api_fails(self):
+        html_page = (
+            b"<html><head><title>Titulo da Pagina</title></head><body>"
+            b'<div class="available-content"><p>Corpo raspado.</p></div></body></html>'
+        )
+        with patch.object(bot, "_fetch_raw", side_effect=[OSError("api fora do ar"), (html_page, "")]):
+            title, body_html = bot.fetch_post("https://x.substack.com", "https://x.substack.com/p/meu-slug")
+        self.assertEqual(title, "Titulo da Pagina")
+        self.assertIn("Corpo raspado.", body_html)
+
+
+class ExtractCitedArticleTest(unittest.TestCase):
+    def test_extracts_title_and_url_from_text_link_entity(self):
+        titulo = "A Quietude e a Bem-Aventurança"
+        text = f"Isso aparece em {titulo}, que fala sobre isso."
+        message = {
+            "text": text,
+            "entities": [{
+                "type": "text_link", "offset": text.index(titulo), "length": len(titulo),
+                "url": "https://san55.substack.com/p/a-quietude",
+            }],
+        }
+        result = bot.extract_cited_article(message)
+        self.assertEqual(result, {
+            "titulo": titulo,
+            "url": "https://san55.substack.com/p/a-quietude",
+        })
+
+    def test_returns_none_without_link_entity(self):
+        self.assertIsNone(bot.extract_cited_article({"text": "sem link nenhum aqui", "entities": []}))
+        self.assertIsNone(bot.extract_cited_article(None))
+
+
+class ResolveArticleForSendTest(unittest.TestCase):
+    def test_resolves_via_semantic_search_when_query_long_enough(self):
+        article = {"titulo": "A Quietude e a Bem-Aventurança", "url": "https://x.com/p/a-quietude"}
+        with patch.object(bot.rag, "find_matching_article", return_value=article) as mock_find:
+            result = bot._resolve_article_for_send(
+                "Mande-me o artigo A Realidade é Tecida de Felicidade.", reply_to=None, bot_id=999,
+            )
+        self.assertEqual(result, article)
+        mock_find.assert_called_once_with("A Realidade é Tecida de Felicidade")
+
+    def test_falls_back_to_cited_article_when_query_too_short(self):
+        titulo = "A Quietude e a Bem-Aventurança"
+        reply_to = {
+            "from": {"id": 999},
+            "text": titulo,
+            "entities": [{"type": "text_link", "offset": 0, "length": len(titulo), "url": "https://x.com/p/a-quietude"}],
+        }
+        with patch.object(bot.rag, "find_matching_article") as mock_find:
+            result = bot._resolve_article_for_send("manda ele", reply_to=reply_to, bot_id=999)
+        mock_find.assert_not_called()
+        self.assertEqual(result, {"titulo": "A Quietude e a Bem-Aventurança", "url": "https://x.com/p/a-quietude"})
+
+    def test_returns_none_when_nothing_resolves(self):
+        with patch.object(bot.rag, "find_matching_article", return_value=None):
+            result = bot._resolve_article_for_send(
+                "Mande-me o artigo Um Título Que Não Existe De Verdade", reply_to=None, bot_id=999,
+            )
+        self.assertIsNone(result)
+
+
+class SendArticleToChatTest(unittest.TestCase):
+    ARTICLE = {"titulo": "A Quietude e a Bem-Aventurança", "url": "https://x.com/p/a-quietude"}
+
+    def test_uses_cached_html_when_available(self):
+        with patch.object(bot, "load_article_content", return_value={
+                 "abc": {"html": "<h1>Cache</h1>", "link": self.ARTICLE["url"]}}), \
+             patch.object(bot, "_fetch_article_html_on_demand") as mock_fetch, \
+             patch.object(bot, "send_rich_message") as mock_send_rich:
+            bot.send_article_to_chat(555, self.ARTICLE)
+        mock_fetch.assert_not_called()
+        mock_send_rich.assert_called_once()
+        self.assertEqual(mock_send_rich.call_args[0][1], "<h1>Cache</h1>")
+
+    def test_fetches_on_demand_when_not_cached(self):
+        with patch.object(bot, "load_article_content", return_value={}), \
+             patch.object(bot, "fetch_post", return_value=("Título", "<p>Corpo</p>")), \
+             patch.object(bot, "substack_base_url", return_value="https://x.com"), \
+             patch.object(bot, "send_rich_message") as mock_send_rich:
+            bot.send_article_to_chat(555, self.ARTICLE)
+        mock_send_rich.assert_called_once()
+        self.assertIn("Corpo", mock_send_rich.call_args[0][1])
+
+    def test_falls_back_to_plain_link_message_when_everything_fails(self):
+        with patch.object(bot, "load_article_content", return_value={}), \
+             patch.object(bot, "fetch_post", side_effect=OSError("fora do ar")), \
+             patch.object(bot, "substack_base_url", return_value="https://x.com"), \
+             patch.object(bot, "send_rich_message") as mock_send_rich, \
+             patch.object(bot, "send_telegram_message") as mock_send:
+            bot.send_article_to_chat(555, self.ARTICLE)
+        mock_send_rich.assert_not_called()
+        mock_send.assert_called_once()
+        args, _ = mock_send.call_args
+        self.assertEqual(args[0], 555)
+        self.assertIn("A Quietude e a Bem-Aventurança", args[1])
+        self.assertIn(self.ARTICLE["url"], args[1])
+
+
+class HandleChatMessageArticleSendTest(unittest.TestCase):
+    """Testa a ramificação em handle_chat_message: pedido de envio de
+    artigo vs. pergunta normal (via process_updates, ponta a ponta)."""
+
+    def _run(self, text, reply_to_message=None):
+        message = {"message_id": 42, "chat": {"id": 555, "type": "private"}, "text": text}
+        if reply_to_message:
+            message["reply_to_message"] = reply_to_message
+        updates = [{"update_id": 4, "message": message}]
+        with patch.object(bot, "SUBSCRIBERS_FILE", Path("test_subscribers_tmp.json")), \
+             patch.object(bot, "OFFSET_FILE", Path("test_offset_tmp.json")), \
+             patch.object(bot, "get_updates", return_value=updates), \
+             patch.object(bot, "get_me", return_value=(999, "meubot")), \
+             patch.object(bot.rag, "should_respond", return_value=True), \
+             patch.object(bot, "send_article_to_chat") as mock_send_article, \
+             patch.object(bot.rag, "answer_question_stream", return_value=iter(["resposta normal"])), \
+             patch.object(bot, "send_rich_message_draft"), \
+             patch.object(bot, "send_rich_message") as mock_send_rich, \
+             patch.object(bot, "send_telegram_message") as mock_send:
+            try:
+                bot.process_updates([])
+                return mock_send_article, mock_send_rich, mock_send
+            finally:
+                bot.SUBSCRIBERS_FILE.unlink(missing_ok=True)
+                bot.OFFSET_FILE.unlink(missing_ok=True)
+
+    def test_clear_send_request_triggers_article_send_not_normal_answer(self):
+        with patch.object(bot.rag, "find_matching_article", return_value={"titulo": "T", "url": "https://x.com/p/t"}):
+            mock_send_article, mock_send_rich, mock_send = self._run("Mande-me o artigo sobre estoicismo.")
+        mock_send_article.assert_called_once()
+        mock_send_rich.assert_not_called()
+
+    def test_normal_question_does_not_trigger_article_send(self):
+        mock_send_article, mock_send_rich, mock_send = self._run("qual o tema do blog?")
+        mock_send_article.assert_not_called()
+        mock_send_rich.assert_called_once()
+
+    def test_intent_classification_failure_falls_back_to_normal_answer(self):
+        with patch.object(bot.rag, "classify_send_intent", side_effect=Exception("api fora do ar")):
+            mock_send_article, mock_send_rich, mock_send = self._run("pergunta ambígua qualquer")
+        mock_send_article.assert_not_called()
+        mock_send_rich.assert_called_once()
 
 
 class GetUpdatesTest(unittest.TestCase):

@@ -18,7 +18,14 @@ from dotenv import load_dotenv
 from voyageai.error import RateLimitError
 
 import rag
-from bot import SUBSTACK_RSS_URL, FETCH_HEADERS, _fetch_raw, decompress_response, strip_html
+from bot import (
+    _fetch_raw,
+    decompress_response,
+    fetch_post,
+    slug_from_url,
+    strip_html,
+    substack_base_url,
+)
 
 load_dotenv()
 
@@ -53,12 +60,6 @@ def _rate_limited_embed(embed_client, batch):
     finally:
         _last_embed_call_at[0] = time.monotonic()
     return result
-
-
-def substack_base_url():
-    if not SUBSTACK_RSS_URL:
-        raise RuntimeError("SUBSTACK_RSS_URL não configurada (.env).")
-    return SUBSTACK_RSS_URL.rsplit("/feed", 1)[0].rstrip("/")
 
 
 def fetch_xml(url):
@@ -99,46 +100,13 @@ def discover_post_urls(base_url):
     return sorted({url for url in locs if POST_URL_RE.search(url)})
 
 
-def slug_from_url(url):
-    return url.rstrip("/").rsplit("/p/", 1)[-1]
-
-
-def fetch_post(base_url, post_url):
-    """Busca o corpo completo de um post via API pública do Substack
-    (usada pelo próprio frontend), com fallback pra raspar a página HTML
-    direto se a API não retornar o esperado."""
-    slug = slug_from_url(post_url)
-    api_url = f"{base_url}/api/v1/posts/{slug}"
-    try:
-        content, content_encoding = _fetch_raw(api_url)
-        content = decompress_response(content, content_encoding)
-        data = json.loads(content)
-        title = data.get("title", "")
-        body_html = data.get("body_html") or ""
-        if title and body_html:
-            return title, strip_html(body_html)
-    except Exception as exc:
-        print(f"Aviso: API falhou pra {post_url} ({exc}); tentando HTML direto.", file=sys.stderr)
-
-    content, content_encoding = _fetch_raw(post_url)
-    html_page = decompress_response(content, content_encoding).decode("utf-8", "ignore")
-    title_match = re.search(r"<title>(.*?)</title>", html_page, re.IGNORECASE | re.DOTALL)
-    title = strip_html(title_match.group(1)) if title_match else slug
-    body_match = re.search(
-        r'<div[^>]+class="[^"]*available-content[^"]*"[^>]*>(.*?)</div>\s*</div>',
-        html_page,
-        re.IGNORECASE | re.DOTALL,
-    )
-    body_html = body_match.group(1) if body_match else html_page
-    return title, strip_html(body_html)
-
-
 def already_indexed_urls(index):
     return {chunk["url"] for chunk in index}
 
 
 def index_article(base_url, post_url, embed_client):
-    title, full_text = fetch_post(base_url, post_url)
+    title, body_html = fetch_post(base_url, post_url)
+    full_text = strip_html(body_html)
     if not full_text:
         print(f"Aviso: artigo sem texto extraído, pulando: {post_url}", file=sys.stderr)
         return []

@@ -202,5 +202,76 @@ class AnswerQuestionStreamTest(unittest.TestCase):
         self.assertEqual(chunks, [rag.REFUSAL_MESSAGE])
 
 
+class StripSendTriggerTest(unittest.TestCase):
+    def test_strips_verb_plus_object_leaving_the_rest(self):
+        result = rag.strip_send_trigger("Mande-me o artigo A Realidade é Tecida de Felicidade.")
+        self.assertEqual(result, "A Realidade é Tecida de Felicidade")
+
+    def test_strips_variant_phrasing(self):
+        self.assertEqual(rag.strip_send_trigger("me envia o link do artigo sobre estoicismo"), "sobre estoicismo")
+        self.assertEqual(rag.strip_send_trigger("quero ler o artigo da dualidade"), "o artigo da dualidade")
+
+    def test_leaves_text_unchanged_when_no_trigger(self):
+        self.assertEqual(rag.strip_send_trigger("o que você acha disso?"), "o que você acha disso?")
+
+
+class ClassifySendIntentTest(unittest.TestCase):
+    def test_detects_clear_send_request_without_calling_claude(self):
+        fake_anthropic = MagicMock()
+        self.assertTrue(rag.classify_send_intent("Mande-me o artigo sobre estoicismo.", fake_anthropic))
+        fake_anthropic.messages.create.assert_not_called()
+
+    def test_detects_clear_question_without_calling_claude(self):
+        fake_anthropic = MagicMock()
+        self.assertFalse(rag.classify_send_intent("Por que isso importa?", fake_anthropic))
+        fake_anthropic.messages.create.assert_not_called()
+
+    def test_ambiguous_message_escalates_to_claude(self):
+        fake_anthropic = MagicMock()
+        text_block = MagicMock(type="text", text="ENVIAR")
+        fake_anthropic.messages.create.return_value = MagicMock(content=[text_block])
+
+        result = rag.classify_send_intent("A Realidade é Tecida de Felicidade.", fake_anthropic)
+
+        self.assertTrue(result)
+        fake_anthropic.messages.create.assert_called_once()
+
+    def test_claude_can_classify_ambiguous_message_as_question(self):
+        fake_anthropic = MagicMock()
+        text_block = MagicMock(type="text", text="PERGUNTA")
+        fake_anthropic.messages.create.return_value = MagicMock(content=[text_block])
+
+        result = rag.classify_send_intent("A Realidade é Tecida de Felicidade.", fake_anthropic)
+
+        self.assertFalse(result)
+
+
+class FindMatchingArticleTest(unittest.TestCase):
+    def test_returns_titulo_and_url_of_best_match(self):
+        index = [{
+            "id": "a", "titulo": "A Quietude e a Bem-Aventurança",
+            "url": "https://san55.substack.com/p/a-quietude", "embedding": [1, 0],
+        }]
+        fake_voyage = MagicMock()
+        fake_voyage.embed.return_value = MagicMock(embeddings=[[1, 0]])  # idêntico -> score 1
+
+        result = rag.find_matching_article("A Realidade é Tecida de Felicidade", index=index, voyage_client=fake_voyage)
+
+        self.assertEqual(result, {"titulo": "A Quietude e a Bem-Aventurança", "url": "https://san55.substack.com/p/a-quietude"})
+
+    def test_returns_none_below_threshold(self):
+        index = [{"id": "a", "titulo": "t", "url": "u", "embedding": [1, 0]}]
+        fake_voyage = MagicMock()
+        fake_voyage.embed.return_value = MagicMock(embeddings=[[0, 1]])  # ortogonal -> score 0
+
+        result = rag.find_matching_article("assunto bem diferente", index=index, voyage_client=fake_voyage)
+
+        self.assertIsNone(result)
+
+    def test_returns_none_for_empty_query_or_index(self):
+        self.assertIsNone(rag.find_matching_article("   ", index=[{"id": "a"}]))
+        self.assertIsNone(rag.find_matching_article("algo", index=[]))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -197,6 +197,106 @@ def answer_question_stream(question, index=None, previous_answer=None, voyage_cl
 
 
 # ---------------------------------------------------------------------------
+# Pedido de envio do artigo completo (vs. pergunta/comentário sobre o tema)
+# ---------------------------------------------------------------------------
+# Bug real que motivou isso: "Mande-me o artigo X" onde X é uma frase que só
+# aparece DENTRO de um artigo (não é o título de nenhum post) fazia o bot
+# tratar isso como pedido de um artigo "com esse título", não achar nenhum
+# título igual, e recusar — mesmo já tendo identificado o artigo certo por
+# busca semântica na mensagem anterior. Precisa separar duas coisas: (1) a
+# pessoa quer receber o artigo (ação: mandar) ou só falar sobre ele (ação:
+# responder)? e (2) dado que quer receber, qual artigo é — usando a mesma
+# busca semântica de sempre sobre o texto (não um match de título exato).
+
+# Verbos comuns de pedir envio (+ eventual pronome enclítico: "mande-me"),
+# seguidos, a uma distância curta, do que se pede (artigo/link/texto ou um
+# pronome retomando o que foi citado antes). Cobre a forma mais comum de
+# pedir em português — não precisa ser exaustivo, porque o que não bater
+# aqui e também não parecer claramente uma pergunta cai numa checagem extra
+# com o Claude (ver classify_send_intent).
+_SEND_VERB_RE = r"(?:me\s+)?(?:mand[ae]|envi[ae]|pass[ae]|compartilh[ae])\w*(?:-me)?"
+_SEND_OBJECT_RE = r"(?:o\s+)?(?:artigo|texto|post|mat[ée]ria|link|pdf|ele|ela|isso|esse|essa)"
+ARTICLE_SEND_TRIGGER_RE = re.compile(
+    rf"\b{_SEND_VERB_RE}\b[^.!?\n]{{0,30}}\b{_SEND_OBJECT_RE}\b"
+    rf"|\bquero\s+(?:ler|o\s+artigo|o\s+texto|o\s+link)\b"
+    r"|\blink\s+do\s+artigo\b"
+    r"|\bartigo\s+completo\b"
+    r"|\bcad[eê]\s+o\s+artigo\b",
+    re.IGNORECASE,
+)
+
+# Sinal de que É uma pergunta (não um pedido de envio) — checado só quando o
+# gatilho de envio acima não bateu. "pq" cobre a abreviação comum de
+# "por que" nesse contexto de início de frase.
+_QUESTION_HINT_RE = re.compile(
+    r"[?？]|^\s*(o\s+que|por\s*que|pq|como|qual|quando|quem|onde)\b", re.IGNORECASE,
+)
+
+_INTENT_CLASSIFIER_PROMPT = """A mensagem abaixo foi mandada num chat de um bot que \
+responde perguntas sobre os artigos de um blog. Responda com UMA ÚNICA palavra: \
+ENVIAR se a pessoa está pedindo pra receber/ler o artigo (o texto completo, o \
+link, o post em si), ou PERGUNTA se é uma pergunta, comentário ou pedido de \
+opinião sobre o conteúdo/tema dos artigos.
+
+Mensagem: {text}"""
+
+
+def strip_send_trigger(text):
+    """Remove a frase-gatilho de pedido de envio, deixando só o que sobrou
+    (título/trecho/tema) pra usar como busca — ex: 'me manda o artigo sobre
+    X' vira 'sobre X'."""
+    return ARTICLE_SEND_TRIGGER_RE.sub("", text).strip(" ,.:;-")
+
+
+def _send_intent_heuristic(text):
+    """Primeira tentativa, sem chamar API nenhuma: True se bate com um
+    gatilho claro de pedido de envio, False se parece claramente uma
+    pergunta, None se ficou ambíguo (aí quem chama decide escalar pro
+    Claude)."""
+    if ARTICLE_SEND_TRIGGER_RE.search(text):
+        return True
+    if _QUESTION_HINT_RE.search(text):
+        return False
+    return None
+
+
+def classify_send_intent(text, anthropic_client=None):
+    """Decide se a mensagem é um pedido pra mandar o artigo (True) ou uma
+    pergunta/comentário sobre o tema (False, o padrão de sempre). Tenta a
+    heurística por regex primeiro (grátis, instantânea); só cai numa
+    chamada leve ao Claude (max_tokens baixo, resposta de uma palavra)
+    quando ela não é conclusiva."""
+    heuristic = _send_intent_heuristic(text)
+    if heuristic is not None:
+        return heuristic
+
+    client = anthropic_client or _anthropic_client()
+    response = client.messages.create(
+        model=CLAUDE_MODEL,
+        max_tokens=5,
+        messages=[{"role": "user", "content": _INTENT_CLASSIFIER_PROMPT.format(text=text)}],
+    )
+    answer = "".join(block.text for block in response.content if block.type == "text").strip().upper()
+    return answer.startswith("ENVIAR")
+
+
+def find_matching_article(query_text, index=None, voyage_client=None):
+    """Acha o artigo mais relevante pro texto (já sem a frase-gatilho) via a
+    mesma busca semântica do chat normal — não é um match de título exato,
+    é o mesmo LIMIAR_RELEVANCIA de sempre sobre o conteúdo inteiro. Retorna
+    {'titulo', 'url'} do melhor chunk, ou None se nada passar do limiar —
+    preserva a regra de nunca inventar um artigo que não existe."""
+    index = load_articles_index() if index is None else index
+    if not index or not query_text.strip():
+        return None
+    scored_chunks = _relevant_chunks_or_none(query_text, index, voyage_client)
+    if not scored_chunks:
+        return None
+    best_chunk = scored_chunks[0][1]
+    return {"titulo": best_chunk.get("titulo", ""), "url": best_chunk.get("url", "")}
+
+
+# ---------------------------------------------------------------------------
 # Regras de quando responder (privado sempre; grupo só se mencionado ou reply)
 # ---------------------------------------------------------------------------
 

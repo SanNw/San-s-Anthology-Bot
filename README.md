@@ -20,6 +20,15 @@ Além dos comandos, o bot responde perguntas com base **exclusivamente** no cont
 - Funciona a partir do índice gerado por `index_articles.py` (veja a seção "Indexar os artigos" abaixo) — sem indexação, o bot sempre recusa por falta de conteúdo.
 - Sempre que a resposta cita um artigo, o Claude é instruído (via `SYSTEM_PROMPT` em `rag.py`) a linkar o título usando a URL do próprio trecho de contexto — `markdown_to_telegram_html` em `bot.py` converte esse link em uma tag `<a href>` real antes de enviar.
 
+### "Me manda o artigo X" — pedido de envio vs. pergunta sobre o tema
+
+Antes de decidir como responder, o bot classifica a intenção da mensagem (`rag.classify_send_intent`): é um **pedido pra receber o artigo** ("mande-me", "me envia", "quero ler", "link do artigo" etc.) ou uma **pergunta/comentário** sobre o conteúdo (o caso comum, tratado pelo RAG normal acima)?
+
+- A classificação é uma heurística por regex primeiro (grátis, instantânea, cobre a forma mais comum de pedir em português); só escala pra uma chamada leve ao Claude (`max_tokens=5`) quando a heurística não é conclusiva — nem parece claramente um pedido de envio, nem claramente uma pergunta.
+- Identificado como pedido de envio, o bot busca o artigo pelo texto que sobrou depois de tirar a frase-gatilho (`rag.find_matching_article`) — é a **mesma busca semântica** do chat normal, então funciona mesmo quando a pessoa cita um trecho/frase que só aparece *dentro* do artigo, não o título exato dele. Se o texto restante for curto/vago demais ("manda esse artigo"), tenta reaproveitar o artigo citado na mensagem sendo respondida (via reply ao bot).
+- Só recusa ("não encontrei nenhum artigo...") quando nenhum chunk passa do `LIMIAR_RELEVANCIA` — a regra de nunca inventar um artigo que não existe continua valendo.
+- Pra mandar de fato: reaproveita o HTML já pronto em `article_content.json` se o artigo já foi publicado pelo bot; senão busca o HTML na hora direto do Substack (`fetch_post`, a mesma função que `index_articles.py` usa pra indexar) e monta a rich message. Se qualquer etapa falhar, cai numa mensagem comum com título + link do Substack.
+
 ### Ler artigo completo (Rich Messages)
 
 Cada artigo publicado (no canal e para cada assinante) ganha um botão inline **"📄 Ler artigo completo"**. Ao clicar, o bot manda o artigo inteiro formatado (títulos, listas, citações, imagens) usando `sendRichMessage` — método novo do Bot API (10.1/10.2, junho/julho de 2026) que aceita HTML estruturado numa mensagem só, em vez do `sendMessage` tradicional.

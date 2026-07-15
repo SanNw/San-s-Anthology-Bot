@@ -259,6 +259,51 @@ def fetch_feed(url):
     return feedparser.parse(sanitize_xml_bytes(content))
 
 
+def substack_base_url():
+    if not SUBSTACK_RSS_URL:
+        raise RuntimeError("SUBSTACK_RSS_URL não configurada (.env).")
+    return SUBSTACK_RSS_URL.rsplit("/feed", 1)[0].rstrip("/")
+
+
+def slug_from_url(post_url):
+    return post_url.rstrip("/").rsplit("/p/", 1)[-1]
+
+
+def fetch_post(base_url, post_url):
+    """Busca título + HTML completo de um post via API pública do Substack
+    (usada pelo próprio frontend), com fallback pra raspar a página HTML
+    direto se a API não retornar o esperado. Mora em bot.py (não em
+    index_articles.py, de onde foi movida) porque agora também é usada pelo
+    chat pra buscar sob demanda o artigo completo quando alguém pede pra
+    receber um post que ainda não está em article_content.json (ver
+    _fetch_article_html_on_demand). Devolve o HTML bruto — quem indexa
+    (index_articles.py) que decide extrair só o texto puro."""
+    slug = slug_from_url(post_url)
+    api_url = f"{base_url}/api/v1/posts/{slug}"
+    try:
+        content, content_encoding = _fetch_raw(api_url)
+        content = decompress_response(content, content_encoding)
+        data = json.loads(content)
+        title = data.get("title", "")
+        body_html = data.get("body_html") or ""
+        if title and body_html:
+            return title, body_html
+    except Exception as exc:
+        print(f"Aviso: API falhou pra {post_url} ({exc}); tentando HTML direto.", file=sys.stderr)
+
+    content, content_encoding = _fetch_raw(post_url)
+    html_page = decompress_response(content, content_encoding).decode("utf-8", "ignore")
+    title_match = re.search(r"<title>(.*?)</title>", html_page, re.IGNORECASE | re.DOTALL)
+    title = strip_html(title_match.group(1)) if title_match else slug
+    body_match = re.search(
+        r'<div[^>]+class="[^"]*available-content[^"]*"[^>]*>(.*?)</div>\s*</div>',
+        html_page,
+        re.IGNORECASE | re.DOTALL,
+    )
+    body_html = body_match.group(1) if body_match else html_page
+    return title, body_html
+
+
 # ---------------------------------------------------------------------------
 # Persistência local (posted.json, subscribers.json, update_offset.json)
 # ---------------------------------------------------------------------------
@@ -643,6 +688,129 @@ def _stream_chat_reply(chat_id, question, previous_answer, draft_id, message_thr
     )
 
 
+# ---------------------------------------------------------------------------
+# Pedido de "me manda o artigo" (vs. pergunta/comentário sobre o tema)
+# ---------------------------------------------------------------------------
+
+ARTICLE_NOT_FOUND_MESSAGE = (
+    "😕 Não encontrei nenhum artigo que bata com isso no meu índice. "
+    "Tenta descrever melhor o título ou o assunto?"
+)
+
+# Abaixo disso ("manda o artigo", "manda ele"), o que sobra depois de tirar
+# a frase-gatilho é curto/vago demais pra buscar sozinho — melhor tentar o
+# artigo citado na conversa do que arriscar um match ruim.
+MIN_ARTICLE_QUERY_LENGTH = 12
+
+
+def extract_cited_article(message):
+    """Extrai o artigo citado numa mensagem do bot a partir das entities do
+    Telegram — o campo `text` sozinho não carrega a URL do link, só o texto
+    visível (markdown_to_telegram_html manda a citação do RAG como <a href>,
+    e o Telegram devolve isso via entities[].type == 'text_link', não no
+    texto). Usado quando o pedido de envio é vago ('manda esse artigo') mas
+    é uma reply a uma resposta do bot que já tinha citado um artigo."""
+    if not message:
+        return None
+    text = message.get("text") or ""
+    for entity in message.get("entities") or []:
+        if entity.get("type") == "text_link" and entity.get("url"):
+            offset, length = entity["offset"], entity["length"]
+            return {"titulo": text[offset:offset + length], "url": entity["url"]}
+    return None
+
+
+def _resolve_article_for_send(question, reply_to, bot_id):
+    """Descobre a qual artigo um pedido de envio se refere: busca pelo texto
+    restante depois de tirar a frase-gatilho ('manda o artigo X' -> busca
+    por 'X', que pode ser um título ou um trecho/citação de dentro do
+    artigo — rag.find_matching_article é semântico, não exige título exato).
+    Se isso não for possível (texto curto/vago demais), tenta o artigo
+    citado na mensagem sendo respondida, quando é uma reply ao bot."""
+    search_text = rag.strip_send_trigger(question)
+    if len(search_text) >= MIN_ARTICLE_QUERY_LENGTH:
+        article = rag.find_matching_article(search_text)
+        if article:
+            return article
+
+    if reply_to and reply_to.get("from", {}).get("id") == bot_id:
+        cited = extract_cited_article(reply_to)
+        if cited:
+            return cited
+
+    return None
+
+
+def _find_cached_article_html(article_url):
+    """Procura o HTML já pronto de um artigo em article_content.json, pelo
+    link — não pelo short_id, porque o short_id de lá é derivado do
+    entry_id do feed (id ou link da entry), que pode não ser bit-a-bit
+    igual à URL vinda do índice do RAG (ex: barra final, query string)."""
+    for cached in load_article_content().values():
+        if cached.get("link") == article_url:
+            return cached.get("html")
+    return None
+
+
+def _fetch_article_html_on_demand(article):
+    """Busca o HTML completo de um artigo direto do Substack — usado quando
+    ele ainda não está em article_content.json (só entram lá os artigos
+    publicados automaticamente depois que essa funcionalidade passou a
+    existir; os demais 121 precisam ser buscados na hora)."""
+    title, body_html = fetch_post(substack_base_url(), article["url"])
+    return rich_message.build_full_article_html(title=title, link=article["url"], raw_body_html=body_html)
+
+
+def send_article_to_chat(chat_id, article, reply_to_message_id=None, message_thread_id=None):
+    """Manda o artigo identificado por _resolve_article_for_send pro chat:
+    reaproveita o HTML já pronto se o bot já publicou esse artigo (cache em
+    article_content.json), senão busca na hora. Se o rich message falhar por
+    qualquer motivo (busca ou envio), cai pra uma mensagem comum com título
+    + link do Substack — nunca deixa o pedido sem resposta nenhuma."""
+    try:
+        article_html = _find_cached_article_html(article["url"]) or _fetch_article_html_on_demand(article)
+        send_rich_message(
+            chat_id, article_html,
+            reply_to_message_id=reply_to_message_id, message_thread_id=message_thread_id,
+        )
+        return
+    except Exception as exc:
+        print(f"Falha ao mandar artigo completo via chat: {_error_detail(exc)}", file=sys.stderr)
+
+    title_html = html.escape(article.get("titulo", ""), quote=False)
+    fallback_text = (
+        f'📄 <b>{title_html}</b>\n\n'
+        f'<a href="{html.escape(article["url"], quote=True)}">Leia no Substack →</a>'
+    )
+    try:
+        send_telegram_message(
+            chat_id, fallback_text,
+            reply_to_message_id=reply_to_message_id, message_thread_id=message_thread_id,
+        )
+    except requests.RequestException as exc:
+        print(f"Falha ao mandar fallback do artigo: {_error_detail(exc)}", file=sys.stderr)
+
+
+def _handle_article_send_request(chat_id, question, message, reply_to, bot_id):
+    article = _resolve_article_for_send(question, reply_to, bot_id)
+    if not article:
+        try:
+            send_telegram_message(
+                chat_id, ARTICLE_NOT_FOUND_MESSAGE,
+                reply_to_message_id=message.get("message_id"),
+                message_thread_id=message.get("message_thread_id"),
+            )
+        except requests.RequestException:
+            pass
+        return
+
+    send_article_to_chat(
+        chat_id, article,
+        reply_to_message_id=message.get("message_id"),
+        message_thread_id=message.get("message_thread_id"),
+    )
+
+
 def handle_chat_message(message, bot_id, bot_username):
     """Responde uma mensagem via RAG (chat sobre os artigos), se elegível
     pelas regras de privado/menção/reply. Erros não derrubam o processamento
@@ -660,6 +828,19 @@ def handle_chat_message(message, bot_id, bot_username):
     previous_answer = None
     if reply_to and reply_to.get("from", {}).get("id") == bot_id:
         previous_answer = reply_to.get("text")
+
+    try:
+        wants_article = rag.classify_send_intent(question)
+    except Exception as exc:
+        # Se a classificação falhar (ex: API fora do ar), segue como
+        # pergunta normal — é o comportamento de sempre, mais seguro que
+        # travar o pedido inteiro por causa de uma etapa auxiliar.
+        print(f"Falha ao classificar intenção da mensagem (seguindo como pergunta): {exc}", file=sys.stderr)
+        wants_article = False
+
+    if wants_article:
+        _handle_article_send_request(chat_id, question, message, reply_to, bot_id)
+        return
 
     # sendRichMessageDraft só funciona em chat privado (ver doc do método);
     # em grupo (menção/reply) mantemos o fluxo de sempre, sem streaming.
