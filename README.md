@@ -18,6 +18,19 @@ Além dos comandos, o bot responde perguntas com base **exclusivamente** no cont
 - **Em grupos:** só responde se for **mencionado** (`@usuario_do_bot`) ou se a mensagem for **reply direto a uma mensagem do próprio bot**. Qualquer outra mensagem em grupo é ignorada.
 - **Guardrail de escopo:** se a pergunta fugir dos temas cobertos pelos artigos — mesmo no meio de uma conversa que começou dentro do tema — o bot recusa educadamente, avisando que não tem permissão para falar sobre assuntos fora desses tópicos. Cada mensagem é avaliada individualmente por relevância (busca por similaridade contra o índice de artigos); se a melhor similaridade encontrada ficar abaixo de `LIMIAR_RELEVANCIA` (constante em `rag.py`, padrão `0.35`), o bot recusa direto, sem gastar uma chamada à API do Claude.
 - Funciona a partir do índice gerado por `index_articles.py` (veja a seção "Indexar os artigos" abaixo) — sem indexação, o bot sempre recusa por falta de conteúdo.
+- Sempre que a resposta cita um artigo, o Claude é instruído (via `SYSTEM_PROMPT` em `rag.py`) a linkar o título usando a URL do próprio trecho de contexto — `markdown_to_telegram_html` em `bot.py` converte esse link em uma tag `<a href>` real antes de enviar.
+
+### Ler artigo completo (Rich Messages)
+
+Cada artigo publicado (no canal e para cada assinante) ganha um botão inline **"📄 Ler artigo completo"**. Ao clicar, o bot manda o artigo inteiro formatado (títulos, listas, citações, imagens) usando `sendRichMessage` — método novo do Bot API (10.1/10.2, junho/julho de 2026) que aceita HTML estruturado numa mensagem só, em vez do `sendMessage` tradicional.
+
+- `rich_message.py` sanitiza o HTML bruto do artigo (que já vem do feed) para o subconjunto de tags que o `sendRichMessage` aceita — remove `<div>`/`<span>`/`<iframe>` de wrappers do Substack (mantendo o texto de dentro, exceto de `<iframe>`, que é descartado inteiro), valida esquemas de link e de imagem (só `http(s)`), e corta o corpo se passar do limite de 32.768 caracteres, sempre preservando título e link final.
+- O HTML pronto de cada artigo é persistido em `article_content.json`, indexado por um hash curto (`article_short_id`) — é esse hash que vai no `callback_data` do botão, porque o Telegram limita esse campo a 64 bytes (não cabe uma URL completa).
+- **Fallback automático**: se `sendRichMessage` falhar por qualquer motivo (é uma API muito nova, com poucas horas de existência na primeira vez que foi testada aqui), o bot cai para uma mensagem comum com o link do artigo no Substack, em vez de deixar o clique sem resposta.
+- **Streaming (`sendRichMessageDraft`) ainda não foi implementado** de propósito — dá pra transmitir a resposta do chat/RAG em partes conforme é gerada, mas isso exigiria trocar `rag.py` para streaming da API do Claude. Ficou de fora até validar `sendRichMessage` funcionando de verdade em produção primeiro.
+- Só artigos publicados **depois** dessa funcionalidade existir têm o botão funcional — publicações antigas não têm entrada em `article_content.json`.
+
+Pra testar localmente sem publicar de verdade, rode os testes (abaixo) — eles cobrem o sanitizador de HTML com título/lista/citação/imagem de exemplo e os três caminhos do clique no botão (sucesso, falha com fallback, e artigo não encontrado).
 
 ### Comandos do bot
 
@@ -95,7 +108,7 @@ python bot.py
 Para rodar os testes:
 
 ```bash
-python -m unittest test_bot.py test_rag.py -v
+python -m unittest test_bot.py test_rag.py test_rich_message.py -v
 ```
 
 ## 5. Indexar os artigos (RAG)
@@ -153,14 +166,17 @@ Depois de gerar/atualizar o `articles_index.json` localmente (seção 5), **comm
 ```
 bot.py                    # script principal: modo webhook (Render) ou polling (local), publica artigos, comandos e dispatch do chat/RAG
 rag.py                    # busca por similaridade, guardrail de escopo e chamada à API do Claude
+rich_message.py            # sanitiza HTML de artigo pro sendRichMessage (botão "Ler artigo completo")
 index_articles.py         # indexação (sob demanda) do texto completo dos artigos pro RAG
-test_bot.py                # testes das funções de parsing, comandos, dispatch de chat e do servidor webhook
+test_bot.py                # testes das funções de parsing, comandos, dispatch de chat, callback_query e do servidor webhook
 test_rag.py                # testes de chunking, similaridade de cosseno e guardrail do RAG
+test_rich_message.py       # testes do sanitizador de HTML e do construtor do artigo completo
 requirements.txt           # dependências (feedparser, requests, python-dotenv, anthropic, voyageai, numpy)
 .env.example                # modelo das variáveis de ambiente
 render.yaml                 # Blueprint do Render (Web Service free)
 posted.json                 # artigos já publicados (versionado; o bot commita as mudanças em produção)
 subscribers.json            # chat_ids inscritos para receber artigos no privado (idem)
 update_offset.json          # só usado no modo polling local; irrelevante no webhook (idem)
+article_content.json        # HTML completo de cada artigo publicado, pro botão "Ler artigo completo" (idem)
 articles_index.json         # chunks + embeddings dos artigos, gerado por index_articles.py (versionado)
 ```

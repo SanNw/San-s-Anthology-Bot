@@ -65,6 +65,16 @@ class MarkdownToTelegramHtmlTest(unittest.TestCase):
         self.assertEqual(result, "Isso ficou **truncado no meio")
         self.assertNotIn("<b>", result)
 
+    def test_converts_markdown_link_citation_to_anchor_tag(self):
+        result = bot.markdown_to_telegram_html(
+            "Como visto em [O Verbo e a Criação](https://san55.substack.com/p/o-verbo), o cosmos..."
+        )
+        self.assertIn('<a href="https://san55.substack.com/p/o-verbo">O Verbo e a Criação</a>', result)
+
+    def test_ignores_non_http_link_scheme(self):
+        result = bot.markdown_to_telegram_html("[clique](javascript:alert(1))")
+        self.assertNotIn("<a", result)
+
 
 class ExtractImageUrlTest(unittest.TestCase):
     def test_prefers_media_content(self):
@@ -400,6 +410,61 @@ class ProcessUpdatesTest(unittest.TestCase):
                 bot.OFFSET_FILE.unlink(missing_ok=True)
 
 
+class HandleCallbackQueryTest(unittest.TestCase):
+    def _callback(self, data):
+        return {
+            "id": "cbq1",
+            "data": data,
+            "message": {"chat": {"id": 555}, "message_id": 42},
+        }
+
+    def test_sends_rich_article_and_answers_callback_on_success(self):
+        with patch.object(bot, "ARTICLE_CONTENT_FILE", Path("test_article_content_tmp.json")), \
+             patch.object(bot, "send_rich_article_message") as mock_rich, \
+             patch.object(bot, "answer_callback_query") as mock_answer:
+            try:
+                bot.save_article_content({"abc123": {"html": "<h1>Título</h1>", "link": "https://x.com/p/a"}})
+                bot.handle_callback_query(self._callback("art:abc123"))
+            finally:
+                bot.ARTICLE_CONTENT_FILE.unlink(missing_ok=True)
+        mock_rich.assert_called_once_with(555, "<h1>Título</h1>")
+        mock_answer.assert_called_once_with("cbq1")
+
+    def test_falls_back_to_link_message_when_rich_send_fails(self):
+        with patch.object(bot, "ARTICLE_CONTENT_FILE", Path("test_article_content_tmp.json")), \
+             patch.object(bot, "send_rich_article_message", side_effect=requests.HTTPError("400 Client Error")), \
+             patch.object(bot, "send_telegram_message") as mock_send, \
+             patch.object(bot, "answer_callback_query") as mock_answer:
+            try:
+                bot.save_article_content({"abc123": {"html": "<h1>Título</h1>", "link": "https://x.com/p/a"}})
+                bot.handle_callback_query(self._callback("art:abc123"))
+            finally:
+                bot.ARTICLE_CONTENT_FILE.unlink(missing_ok=True)
+        mock_send.assert_called_once()
+        self.assertIn("https://x.com/p/a", mock_send.call_args[0][1])
+        mock_answer.assert_called_once()
+        self.assertTrue(mock_answer.call_args.kwargs.get("show_alert"))
+
+    def test_answers_with_alert_when_short_id_unknown(self):
+        with patch.object(bot, "ARTICLE_CONTENT_FILE", Path("test_article_content_tmp.json")), \
+             patch.object(bot, "send_rich_article_message") as mock_rich, \
+             patch.object(bot, "answer_callback_query") as mock_answer:
+            try:
+                bot.handle_callback_query(self._callback("art:nao-existe"))
+            finally:
+                bot.ARTICLE_CONTENT_FILE.unlink(missing_ok=True)
+        mock_rich.assert_not_called()
+        mock_answer.assert_called_once()
+        self.assertTrue(mock_answer.call_args.kwargs.get("show_alert"))
+
+    def test_ignores_unrelated_callback_data(self):
+        with patch.object(bot, "send_rich_article_message") as mock_rich, \
+             patch.object(bot, "answer_callback_query") as mock_answer:
+            bot.handle_callback_query(self._callback("outra_coisa"))
+        mock_rich.assert_not_called()
+        mock_answer.assert_called_once_with("cbq1")
+
+
 class GetUpdatesTest(unittest.TestCase):
     def _mock_response(self):
         response = Mock()
@@ -431,6 +496,7 @@ class FetchAndPublishTest(unittest.TestCase):
         entry["id"] = entry["link"]
         feed = bot.feedparser.FeedParserDict(bozo=False, entries=[entry])
         with patch.object(bot, "POSTED_FILE", Path("test_posted_tmp.json")), \
+             patch.object(bot, "ARTICLE_CONTENT_FILE", Path("test_article_content_tmp.json")), \
              patch.object(bot, "fetch_feed", return_value=feed), \
              patch.object(bot, "send_telegram_message") as mock_send:
             try:
@@ -438,27 +504,40 @@ class FetchAndPublishTest(unittest.TestCase):
                 result = bot.fetch_and_publish()
             finally:
                 bot.POSTED_FILE.unlink(missing_ok=True)
+                bot.ARTICLE_CONTENT_FILE.unlink(missing_ok=True)
         self.assertEqual(result, [entry])
         mock_send.assert_not_called()
 
     def test_publishes_new_entry_and_returns_entries_for_caching(self):
         entry = FakeEntry(title="Artigo Novo", link="https://example.com/novo")
         entry["id"] = entry["link"]
+        entry["content"] = [{"value": "<p>Corpo do artigo novo.</p>"}]
         feed = bot.feedparser.FeedParserDict(bozo=False, entries=[entry])
         with patch.object(bot, "POSTED_FILE", Path("test_posted_tmp.json")), \
              patch.object(bot, "SUBSCRIBERS_FILE", Path("test_subscribers_tmp.json")), \
+             patch.object(bot, "ARTICLE_CONTENT_FILE", Path("test_article_content_tmp.json")), \
              patch.object(bot, "fetch_feed", return_value=feed), \
              patch.object(bot, "send_telegram_message") as mock_send:
             try:
                 result = bot.fetch_and_publish()
                 posted = bot.load_posted()
+                article_content = bot.load_article_content()
             finally:
                 bot.POSTED_FILE.unlink(missing_ok=True)
                 bot.SUBSCRIBERS_FILE.unlink(missing_ok=True)
+                bot.ARTICLE_CONTENT_FILE.unlink(missing_ok=True)
         self.assertEqual(result, [entry])
         self.assertIn(entry["id"], posted)
         mock_send.assert_called_once()
         self.assertEqual(mock_send.call_args[0][0], bot.TELEGRAM_CHANNEL_ID)
+
+        # O post ganhou o botão "Ler artigo completo", e o HTML do artigo foi
+        # persistido sob o mesmo short_id usado no callback_data do botão.
+        _, kwargs = mock_send.call_args
+        short_id = kwargs["reply_markup"]["inline_keyboard"][0][0]["callback_data"].removeprefix("art:")
+        self.assertIn(short_id, article_content)
+        self.assertIn("Corpo do artigo novo.", article_content[short_id]["html"])
+        self.assertEqual(article_content[short_id]["link"], entry["link"])
 
 
 class ErrorDetailTest(unittest.TestCase):

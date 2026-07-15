@@ -2,6 +2,7 @@
 e nos assinantes que interagiram com o bot no privado, além de responder a comandos."""
 
 import gzip
+import hashlib
 import html
 import io
 import json
@@ -23,6 +24,7 @@ import requests
 from dotenv import load_dotenv
 
 import rag
+import rich_message
 
 load_dotenv()
 
@@ -39,7 +41,13 @@ DATA_DIR = Path(os.getenv("DATA_DIR", str(BASE_DIR)))
 POSTED_FILE = DATA_DIR / "posted.json"
 SUBSCRIBERS_FILE = DATA_DIR / "subscribers.json"
 OFFSET_FILE = DATA_DIR / "update_offset.json"
-STATE_FILENAMES = ("posted.json", "subscribers.json", "update_offset.json")
+# Guarda o HTML já pronto (sanitizado pro sendRichMessage) de cada artigo
+# publicado, indexado pelo short_id usado no callback_data do botão "Ler
+# artigo completo" — callback_data tem limite de 64 bytes, então não dá pra
+# usar a URL do artigo direto. Cresce um pouco a cada post, mas cada entrada
+# é só texto (nada de embeddings), então é bem mais leve que articles_index.json.
+ARTICLE_CONTENT_FILE = DATA_DIR / "article_content.json"
+STATE_FILENAMES = ("posted.json", "subscribers.json", "update_offset.json", "article_content.json")
 
 SUMMARY_MAX_LENGTH = 500
 RECENT_ARTICLES_COUNT = 5
@@ -291,6 +299,20 @@ def save_offset(offset):
     _save_json(OFFSET_FILE, {"offset": offset})
 
 
+def load_article_content():
+    return _load_json(ARTICLE_CONTENT_FILE, {})
+
+
+def save_article_content(content_by_short_id):
+    _save_json(ARTICLE_CONTENT_FILE, content_by_short_id)
+
+
+def article_short_id(entry_identifier):
+    """ID curto e estável pro callback_data do botão 'Ler artigo completo'
+    (limite de 64 bytes do Telegram não deixa usar a URL do artigo direto)."""
+    return hashlib.sha256(entry_identifier.encode("utf-8")).hexdigest()[:16]
+
+
 _git_remote_configured = False
 
 
@@ -355,7 +377,7 @@ def _error_detail(exc):
     return str(exc)
 
 
-def send_telegram_message(chat_id, text, reply_to_message_id=None, message_thread_id=None):
+def send_telegram_message(chat_id, text, reply_to_message_id=None, message_thread_id=None, reply_markup=None):
     url = TELEGRAM_API_BASE.format(token=TELEGRAM_BOT_TOKEN, method="sendMessage")
     payload = {
         "chat_id": chat_id,
@@ -367,6 +389,8 @@ def send_telegram_message(chat_id, text, reply_to_message_id=None, message_threa
         payload["reply_to_message_id"] = reply_to_message_id
     if message_thread_id is not None:
         payload["message_thread_id"] = message_thread_id
+    if reply_markup is not None:
+        payload["reply_markup"] = json.dumps(reply_markup)
     response = requests.post(url, data=payload, timeout=30)
     response.raise_for_status()
     return response.json()
@@ -381,7 +405,7 @@ def get_me():
     return result.get("id"), result.get("username")
 
 
-def send_telegram_photo(chat_id, photo_url, caption):
+def send_telegram_photo(chat_id, photo_url, caption, reply_markup=None):
     url = TELEGRAM_API_BASE.format(token=TELEGRAM_BOT_TOKEN, method="sendPhoto")
     payload = {
         "chat_id": chat_id,
@@ -389,6 +413,38 @@ def send_telegram_photo(chat_id, photo_url, caption):
         "caption": caption,
         "parse_mode": "HTML",
     }
+    if reply_markup is not None:
+        payload["reply_markup"] = json.dumps(reply_markup)
+    response = requests.post(url, data=payload, timeout=30)
+    response.raise_for_status()
+    return response.json()
+
+
+def send_rich_article_message(chat_id, article_html, reply_to_message_id=None):
+    """Manda o artigo completo via sendRichMessage (Bot API 10.1+, rich
+    messages) — o corpo já vem sanitizado por rich_message.build_full_article_html.
+    Diferente das outras chamadas aqui, manda o corpo como JSON puro (em vez de
+    form-encoded): rich_message é um objeto aninhado, e o próprio Telegram
+    aceita application/json no lugar de multipart pra métodos sem upload de
+    arquivo — mais simples que serializar o objeto dentro de um campo de form."""
+    url = TELEGRAM_API_BASE.format(token=TELEGRAM_BOT_TOKEN, method="sendRichMessage")
+    payload = {
+        "chat_id": chat_id,
+        "rich_message": {"html": article_html},
+    }
+    if reply_to_message_id is not None:
+        payload["reply_parameters"] = {"message_id": reply_to_message_id}
+    response = requests.post(url, json=payload, timeout=30)
+    response.raise_for_status()
+    return response.json()
+
+
+def answer_callback_query(callback_query_id, text=None, show_alert=False):
+    url = TELEGRAM_API_BASE.format(token=TELEGRAM_BOT_TOKEN, method="answerCallbackQuery")
+    payload = {"callback_query_id": callback_query_id}
+    if text is not None:
+        payload["text"] = text
+        payload["show_alert"] = show_alert
     response = requests.post(url, data=payload, timeout=30)
     response.raise_for_status()
     return response.json()
@@ -398,7 +454,7 @@ def set_webhook(url):
     """Registra o endpoint que o Telegram vai chamar (POST) a cada mensagem
     nova. Chamado uma vez ao subir o servidor em modo webhook."""
     api_url = TELEGRAM_API_BASE.format(token=TELEGRAM_BOT_TOKEN, method="setWebhook")
-    payload = {"url": url, "allowed_updates": json.dumps(["message"])}
+    payload = {"url": url, "allowed_updates": json.dumps(["message", "callback_query"])}
     if TELEGRAM_WEBHOOK_SECRET:
         payload["secret_token"] = TELEGRAM_WEBHOOK_SECRET
     response = requests.post(api_url, data=payload, timeout=30)
@@ -410,7 +466,7 @@ def get_updates(offset, timeout=0):
     """Busca updates novos. Com timeout > 0, faz long polling: a chamada HTTP
     fica pendurada até chegar mensagem ou o timeout do Telegram expirar."""
     url = TELEGRAM_API_BASE.format(token=TELEGRAM_BOT_TOKEN, method="getUpdates")
-    params = {"timeout": timeout, "allowed_updates": json.dumps(["message"])}
+    params = {"timeout": timeout, "allowed_updates": json.dumps(["message", "callback_query"])}
     if offset:
         params["offset"] = offset
     response = requests.get(url, params=params, timeout=timeout + 10)
@@ -481,6 +537,10 @@ INLINE_CODE_RE = re.compile(r"`([^`\n]+)`")
 HEADER_RE = re.compile(r"^#{1,6}[ \t]*(.+)$", re.MULTILINE)
 BOLD_RE = re.compile(r"\*\*(.+?)\*\*", re.DOTALL)
 ITALIC_RE = re.compile(r"(?<!\*)\*([^*\n]+?)\*(?!\*)")
+# Só http(s): o SYSTEM_PROMPT do rag.py pede citação como [Título](url) usando
+# as URLs dos próprios artigos indexados, então não há motivo legítimo pra um
+# esquema diferente aparecer aqui.
+LINK_RE = re.compile(r"\[([^\[\]]+)\]\((https?://[^\s()]+)\)")
 
 
 def markdown_to_telegram_html(text):
@@ -500,6 +560,7 @@ def markdown_to_telegram_html(text):
     text = HEADER_RE.sub(lambda m: f"<b>{m.group(1)}</b>", text)
     text = BOLD_RE.sub(lambda m: f"<b>{m.group(1)}</b>", text)
     text = ITALIC_RE.sub(lambda m: f"<i>{m.group(1)}</i>", text)
+    text = LINK_RE.sub(lambda m: f'<a href="{m.group(2)}">{m.group(1)}</a>', text)
     return text
 
 
@@ -552,6 +613,55 @@ def handle_chat_message(message, bot_id, bot_username):
         print(f"Falha ao enviar resposta do RAG: {_error_detail(exc)}", file=sys.stderr)
 
 
+READ_FULL_ARTICLE_CALLBACK_PREFIX = "art:"
+READ_FULL_ARTICLE_BUTTON_TEXT = "📄 Ler artigo completo"
+
+
+def build_read_full_article_markup(short_id):
+    return {"inline_keyboard": [[{
+        "text": READ_FULL_ARTICLE_BUTTON_TEXT,
+        "callback_data": f"{READ_FULL_ARTICLE_CALLBACK_PREFIX}{short_id}",
+    }]]}
+
+
+def handle_callback_query(callback_query):
+    """Trata o clique no botão 'Ler artigo completo'. sendRichMessage é uma
+    API muito nova (Bot API 10.1, dias de existência) — se falhar por
+    qualquer motivo, cai pro sendMessage tradicional em vez de deixar o
+    usuário sem resposta."""
+    data = callback_query.get("data") or ""
+    chat_id = callback_query["message"]["chat"]["id"]
+
+    if not data.startswith(READ_FULL_ARTICLE_CALLBACK_PREFIX):
+        answer_callback_query(callback_query["id"])
+        return
+
+    short_id = data[len(READ_FULL_ARTICLE_CALLBACK_PREFIX):]
+    article = load_article_content().get(short_id)
+
+    if article:
+        try:
+            send_rich_article_message(chat_id, article["html"])
+            answer_callback_query(callback_query["id"])
+            return
+        except requests.RequestException as exc:
+            print(f"Falha ao enviar rich message do artigo: {_error_detail(exc)}", file=sys.stderr)
+            try:
+                send_telegram_message(
+                    chat_id,
+                    f'😕 Não consegui montar o artigo formatado agora. '
+                    f'<a href="{html.escape(article["link"], quote=True)}">Leia direto no Substack →</a>',
+                )
+            except requests.RequestException:
+                pass
+
+    answer_callback_query(
+        callback_query["id"],
+        text="Não encontrei mais esse artigo por aqui — tenta o link no post original.",
+        show_alert=True,
+    )
+
+
 def dispatch_message(message, bot_id, bot_username, feed_entries):
     """Processa uma única mensagem: comandos ou, quando elegível, chat/RAG.
     Usada tanto pelo polling (em lote) quanto pelo webhook (uma por vez)."""
@@ -594,6 +704,10 @@ def process_updates(feed_entries, poll_timeout=0):
 
     for update in updates:
         max_update_id = max(max_update_id, update.get("update_id", max_update_id))
+        callback_query = update.get("callback_query")
+        if callback_query:
+            handle_callback_query(callback_query)
+            continue
         message = update.get("message")
         if not message:
             continue
@@ -606,15 +720,15 @@ def process_updates(feed_entries, poll_timeout=0):
 # Publicação de artigos novos
 # ---------------------------------------------------------------------------
 
-def broadcast_to_subscribers(subscribers, caption, image_url):
+def broadcast_to_subscribers(subscribers, caption, image_url, reply_markup=None):
     """Envia o artigo para cada assinante; remove quem bloqueou o bot (HTTP 403)."""
     blocked = set()
     for chat_id in subscribers:
         try:
             if image_url:
-                send_telegram_photo(chat_id, image_url, caption)
+                send_telegram_photo(chat_id, image_url, caption, reply_markup=reply_markup)
             else:
-                send_telegram_message(chat_id, caption)
+                send_telegram_message(chat_id, caption, reply_markup=reply_markup)
         except requests.HTTPError as exc:
             if exc.response is not None and exc.response.status_code == 403:
                 blocked.add(chat_id)
@@ -649,23 +763,39 @@ def fetch_and_publish():
     # feeds RSS costumam vir do mais novo pro mais antigo; publicamos em ordem cronológica
     new_entries.reverse()
 
+    article_content = load_article_content()
+
     for entry in new_entries:
         title = entry.get("title", "(sem título)")
         caption = build_caption(entry)
         image_url = extract_image_url(entry)
+
+        raw_body = ""
+        if entry.get("content"):
+            raw_body = entry["content"][0].get("value", "")
+        raw_body = raw_body or entry.get("summary", "")
+        article_html = rich_message.build_full_article_html(
+            title=strip_html(title), link=entry.get("link", ""), raw_body_html=raw_body,
+        )
+        short_id = article_short_id(entry_id(entry))
+        article_content[short_id] = {"html": article_html, "link": entry.get("link", "")}
+        reply_markup = build_read_full_article_markup(short_id)
+
         try:
             if image_url:
-                send_telegram_photo(TELEGRAM_CHANNEL_ID, image_url, caption)
+                send_telegram_photo(TELEGRAM_CHANNEL_ID, image_url, caption, reply_markup=reply_markup)
             else:
-                send_telegram_message(TELEGRAM_CHANNEL_ID, caption)
+                send_telegram_message(TELEGRAM_CHANNEL_ID, caption, reply_markup=reply_markup)
         except requests.RequestException as exc:
             print(f"Falha ao publicar '{title}' no canal: {_error_detail(exc)}", file=sys.stderr)
             break
 
-        blocked = broadcast_to_subscribers(subscribers, caption, image_url)
+        blocked = broadcast_to_subscribers(subscribers, caption, image_url, reply_markup=reply_markup)
         if blocked:
             subscribers -= blocked
             save_subscribers(subscribers)
+
+        save_article_content(article_content)
 
         posted_ids.add(entry_id(entry))
         save_posted(posted_ids)
@@ -750,8 +880,11 @@ class _WebhookRequestHandler(BaseHTTPRequestHandler):
         body = self.rfile.read(length) if length else b"{}"
         try:
             update = json.loads(body or b"{}")
+            callback_query = update.get("callback_query")
             message = update.get("message")
-            if message:
+            if callback_query:
+                handle_callback_query(callback_query)
+            elif message:
                 with _webhook_state_lock:
                     dispatch_message(message, _webhook_bot_id, _webhook_bot_username, _webhook_cached_entries)
         except Exception as exc:

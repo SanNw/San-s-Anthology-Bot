@@ -43,7 +43,10 @@ que começou dentro do tema — recuse educadamente, dizendo que não tem \
 permissão para falar sobre assuntos fora desses tópicos. Não tente adivinhar \
 ou complementar com informação de fora do contexto.
 - Cite, quando fizer sentido, de qual artigo a informação vem, mas de forma \
-natural dentro da frase — não como nota de rodapé.
+natural dentro da frase — não como nota de rodapé. Sempre que citar um \
+artigo, use a URL dele do próprio contexto e escreva a citação como um link \
+Markdown: [Título do Artigo](url). Nunca invente uma URL — use exatamente a \
+que aparece no contexto para aquele trecho.
 - Responda em português.
 
 Estilo de escrita — isto é uma conversa de chat, não um relatório:
