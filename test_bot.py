@@ -79,5 +79,114 @@ class PostedJsonTest(unittest.TestCase):
             self.assertEqual(bot.load_posted(), set())
 
 
+class SubscribersJsonTest(unittest.TestCase):
+    def test_load_and_save_roundtrip(self):
+        with patch.object(bot, "SUBSCRIBERS_FILE", Path("test_subscribers_tmp.json")):
+            try:
+                bot.save_subscribers({111, 222})
+                self.assertEqual(bot.load_subscribers(), {111, 222})
+            finally:
+                bot.SUBSCRIBERS_FILE.unlink(missing_ok=True)
+
+    def test_load_returns_empty_set_when_file_missing(self):
+        with patch.object(bot, "SUBSCRIBERS_FILE", Path("does_not_exist.json")):
+            self.assertEqual(bot.load_subscribers(), set())
+
+
+class ExtractCategoriesTest(unittest.TestCase):
+    def test_returns_unique_categories_in_order(self):
+        entries = [
+            FakeEntry(tags=[{"term": "Filosofia"}, {"term": "Cultura"}]),
+            FakeEntry(tags=[{"term": "cultura"}, {"term": "Política"}]),
+            FakeEntry(tags=None),
+        ]
+        self.assertEqual(bot.extract_categories(entries), ["Filosofia", "Cultura", "Política"])
+
+    def test_returns_empty_list_when_no_tags(self):
+        self.assertEqual(bot.extract_categories([FakeEntry()]), [])
+
+
+class CommandMessageBuildersTest(unittest.TestCase):
+    def test_categories_message_lists_categories(self):
+        entries = [FakeEntry(tags=[{"term": "Filosofia"}])]
+        message = bot.build_categories_message(entries)
+        self.assertIn("Filosofia", message)
+
+    def test_categories_message_handles_empty(self):
+        message = bot.build_categories_message([])
+        self.assertIn("Nenhuma categoria", message)
+
+    def test_recent_articles_message_lists_titles_and_links(self):
+        entries = [
+            FakeEntry(title="Artigo 1", link="https://example.com/1"),
+            FakeEntry(title="Artigo 2", link="https://example.com/2"),
+        ]
+        message = bot.build_recent_articles_message(entries, count=2)
+        self.assertIn("Artigo 1", message)
+        self.assertIn("https://example.com/1", message)
+        self.assertIn("Artigo 2", message)
+
+    def test_recent_articles_message_respects_count(self):
+        entries = [FakeEntry(title=f"Artigo {i}", link=f"https://example.com/{i}") for i in range(10)]
+        message = bot.build_recent_articles_message(entries, count=3)
+        self.assertIn("Artigo 2", message)
+        self.assertNotIn("Artigo 3", message)
+
+    def test_substack_message_contains_link(self):
+        self.assertIn(bot.SUBSTACK_SUBSCRIBE_URL, bot.build_substack_message())
+
+    def test_sugestao_message_asks_to_send_message(self):
+        message = bot.build_sugestao_message().lower()
+        self.assertIn("mensagem", message)
+
+
+class ProcessUpdatesTest(unittest.TestCase):
+    def _run(self, updates, initial_subscribers=None):
+        with patch.object(bot, "SUBSCRIBERS_FILE", Path("test_subscribers_tmp.json")), \
+             patch.object(bot, "OFFSET_FILE", Path("test_offset_tmp.json")), \
+             patch.object(bot, "get_updates", return_value=updates), \
+             patch.object(bot, "send_telegram_message") as mock_send:
+            try:
+                if initial_subscribers is not None:
+                    bot.save_subscribers(initial_subscribers)
+                bot.process_updates([])
+                return mock_send, bot.load_subscribers()
+            finally:
+                bot.SUBSCRIBERS_FILE.unlink(missing_ok=True)
+                bot.OFFSET_FILE.unlink(missing_ok=True)
+
+    def test_start_command_subscribes_user(self):
+        updates = [{"update_id": 1, "message": {"chat": {"id": 111}, "text": "/start"}}]
+        mock_send, subscribers = self._run(updates)
+        self.assertEqual(subscribers, {111})
+        mock_send.assert_called_once()
+        self.assertEqual(mock_send.call_args[0][0], 111)
+
+    def test_stop_command_unsubscribes_user(self):
+        updates = [{"update_id": 2, "message": {"chat": {"id": 111}, "text": "/stop"}}]
+        mock_send, subscribers = self._run(updates, initial_subscribers={111})
+        self.assertEqual(subscribers, set())
+        mock_send.assert_called_once()
+
+    def test_unknown_text_does_not_subscribe_or_reply(self):
+        updates = [{"update_id": 3, "message": {"chat": {"id": 999}, "text": "oi tudo bem?"}}]
+        mock_send, subscribers = self._run(updates)
+        self.assertEqual(subscribers, set())
+        mock_send.assert_not_called()
+
+    def test_offset_advances_past_processed_updates(self):
+        updates = [{"update_id": 5, "message": {"chat": {"id": 111}, "text": "/start"}}]
+        with patch.object(bot, "SUBSCRIBERS_FILE", Path("test_subscribers_tmp.json")), \
+             patch.object(bot, "OFFSET_FILE", Path("test_offset_tmp.json")), \
+             patch.object(bot, "get_updates", return_value=updates), \
+             patch.object(bot, "send_telegram_message"):
+            try:
+                bot.process_updates([])
+                self.assertEqual(bot.load_offset(), 6)
+            finally:
+                bot.SUBSCRIBERS_FILE.unlink(missing_ok=True)
+                bot.OFFSET_FILE.unlink(missing_ok=True)
+
+
 if __name__ == "__main__":
     unittest.main()
