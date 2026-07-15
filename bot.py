@@ -344,6 +344,17 @@ def sync_state_to_git():
 # Chamadas à Bot API do Telegram
 # ---------------------------------------------------------------------------
 
+TELEGRAM_TEXT_MAX_LENGTH = 3500  # margem abaixo do limite de 4096 do Telegram; escapar HTML pode expandir um pouco o texto
+
+
+def _error_detail(exc):
+    """Descreve uma exceção incluindo o corpo da resposta HTTP, quando houver
+    — um 400/403 da API do Telegram raramente diz o motivo só com str(exc)."""
+    if isinstance(exc, requests.HTTPError) and exc.response is not None:
+        return f"{exc} | corpo: {exc.response.text[:500]}"
+    return str(exc)
+
+
 def send_telegram_message(chat_id, text, reply_to_message_id=None, message_thread_id=None):
     url = TELEGRAM_API_BASE.format(token=TELEGRAM_BOT_TOKEN, method="sendMessage")
     payload = {
@@ -483,12 +494,16 @@ def handle_chat_message(message, bot_id, bot_username):
         print(f"Falha ao responder pergunta via RAG: {exc}", file=sys.stderr)
         return
 
-    send_telegram_message(
-        chat_id,
-        html.escape(answer),
-        reply_to_message_id=message.get("message_id"),
-        message_thread_id=message.get("message_thread_id"),
-    )
+    answer = truncate_summary(answer, max_length=TELEGRAM_TEXT_MAX_LENGTH)
+    try:
+        send_telegram_message(
+            chat_id,
+            html.escape(answer),
+            reply_to_message_id=message.get("message_id"),
+            message_thread_id=message.get("message_thread_id"),
+        )
+    except requests.RequestException as exc:
+        print(f"Falha ao enviar resposta do RAG: {_error_detail(exc)}", file=sys.stderr)
 
 
 def dispatch_message(message, bot_id, bot_username, feed_entries):
@@ -598,7 +613,7 @@ def fetch_and_publish():
             else:
                 send_telegram_message(TELEGRAM_CHANNEL_ID, caption)
         except requests.RequestException as exc:
-            print(f"Falha ao publicar '{title}' no canal: {exc}", file=sys.stderr)
+            print(f"Falha ao publicar '{title}' no canal: {_error_detail(exc)}", file=sys.stderr)
             break
 
         blocked = broadcast_to_subscribers(subscribers, caption, image_url)
@@ -633,7 +648,7 @@ def run_polling_loop():
 
             process_updates(cached_entries, poll_timeout=TELEGRAM_POLL_TIMEOUT_SECONDS)
         except Exception as exc:
-            print(f"Erro inesperado no loop principal: {exc}", file=sys.stderr)
+            print(f"Erro inesperado no loop principal: {_error_detail(exc)}", file=sys.stderr)
             time.sleep(5)
 
 
@@ -694,7 +709,7 @@ class _WebhookRequestHandler(BaseHTTPRequestHandler):
                 with _webhook_state_lock:
                     dispatch_message(message, _webhook_bot_id, _webhook_bot_username, _webhook_cached_entries)
         except Exception as exc:
-            print(f"Erro processando update do webhook: {exc}", file=sys.stderr)
+            print(f"Erro processando update do webhook: {_error_detail(exc)}", file=sys.stderr)
 
         self._respond(200, b"ok")
 

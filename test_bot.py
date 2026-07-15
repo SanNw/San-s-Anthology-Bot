@@ -12,6 +12,8 @@ import zlib
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+import requests
+
 import bot
 
 
@@ -294,6 +296,35 @@ class ProcessUpdatesTest(unittest.TestCase):
         self.assertIn("&lt;isso&gt;", args[1])
         self.assertIn("&amp;", args[1])
 
+    def test_long_rag_answer_is_truncated_before_sending(self):
+        long_answer = "palavra " * 1000  # bem acima do limite de envio do Telegram
+        updates = [{
+            "update_id": 4,
+            "message": {"message_id": 42, "chat": {"id": 555, "type": "private"}, "text": "pergunta"},
+        }]
+        mock_send, _ = self._run(updates, should_respond=True, rag_answer=long_answer)
+        args, _ = mock_send.call_args
+        self.assertLessEqual(len(args[1]), bot.TELEGRAM_TEXT_MAX_LENGTH + 10)
+        self.assertTrue(args[1].endswith("..."))
+
+    def test_send_failure_after_rag_answer_does_not_crash(self):
+        updates = [{
+            "update_id": 4,
+            "message": {"message_id": 42, "chat": {"id": 555, "type": "private"}, "text": "pergunta"},
+        }]
+        with patch.object(bot, "SUBSCRIBERS_FILE", Path("test_subscribers_tmp.json")), \
+             patch.object(bot, "OFFSET_FILE", Path("test_offset_tmp.json")), \
+             patch.object(bot, "get_updates", return_value=updates), \
+             patch.object(bot, "get_me", return_value=(999, "meubot")), \
+             patch.object(bot.rag, "should_respond", return_value=True), \
+             patch.object(bot.rag, "answer_question", return_value="resposta"), \
+             patch.object(bot, "send_telegram_message", side_effect=requests.HTTPError("400 Client Error")):
+            try:
+                bot.process_updates([])
+            finally:
+                bot.SUBSCRIBERS_FILE.unlink(missing_ok=True)
+                bot.OFFSET_FILE.unlink(missing_ok=True)
+
     def test_rag_failure_does_not_crash_or_reply(self):
         updates = [{
             "update_id": 4,
@@ -387,6 +418,16 @@ class FetchAndPublishTest(unittest.TestCase):
         self.assertIn(entry["id"], posted)
         mock_send.assert_called_once()
         self.assertEqual(mock_send.call_args[0][0], bot.TELEGRAM_CHANNEL_ID)
+
+
+class ErrorDetailTest(unittest.TestCase):
+    def test_includes_response_body_for_http_error(self):
+        response = Mock(text='{"description": "Bad Request: message is too long"}')
+        exc = requests.HTTPError("400 Client Error", response=response)
+        self.assertIn("message is too long", bot._error_detail(exc))
+
+    def test_plain_exception_returns_str(self):
+        self.assertEqual(bot._error_detail(ValueError("boom")), "boom")
 
 
 class SyncStateToGitTest(unittest.TestCase):
