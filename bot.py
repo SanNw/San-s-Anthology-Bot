@@ -492,6 +492,15 @@ def handle_chat_message(message, bot_id, bot_username):
         answer = rag.answer_question(question, previous_answer=previous_answer)
     except Exception as exc:
         print(f"Falha ao responder pergunta via RAG: {exc}", file=sys.stderr)
+        try:
+            send_telegram_message(
+                chat_id,
+                "😕 Não consegui responder agora, tenta de novo em alguns minutos.",
+                reply_to_message_id=message.get("message_id"),
+                message_thread_id=message.get("message_thread_id"),
+            )
+        except requests.RequestException:
+            pass
         return
 
     answer = truncate_summary(answer, max_length=TELEGRAM_TEXT_MAX_LENGTH)

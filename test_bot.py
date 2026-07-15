@@ -325,7 +325,7 @@ class ProcessUpdatesTest(unittest.TestCase):
                 bot.SUBSCRIBERS_FILE.unlink(missing_ok=True)
                 bot.OFFSET_FILE.unlink(missing_ok=True)
 
-    def test_rag_failure_does_not_crash_or_reply(self):
+    def test_rag_failure_does_not_crash_and_warns_user(self):
         updates = [{
             "update_id": 4,
             "message": {"message_id": 42, "chat": {"id": 555, "type": "private"}, "text": "pergunta"},
@@ -339,7 +339,10 @@ class ProcessUpdatesTest(unittest.TestCase):
              patch.object(bot, "send_telegram_message") as mock_send:
             try:
                 bot.process_updates([])
-                mock_send.assert_not_called()
+                mock_send.assert_called_once()
+                args, kwargs = mock_send.call_args
+                self.assertEqual(args[0], 555)
+                self.assertEqual(kwargs.get("reply_to_message_id"), 42)
             finally:
                 bot.SUBSCRIBERS_FILE.unlink(missing_ok=True)
                 bot.OFFSET_FILE.unlink(missing_ok=True)
