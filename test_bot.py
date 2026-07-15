@@ -229,10 +229,13 @@ class CommandMessageBuildersTest(unittest.TestCase):
 
 
 class ProcessUpdatesTest(unittest.TestCase):
-    def _run(self, updates, initial_subscribers=None):
+    def _run(self, updates, initial_subscribers=None, should_respond=False, rag_answer="resposta"):
         with patch.object(bot, "SUBSCRIBERS_FILE", Path("test_subscribers_tmp.json")), \
              patch.object(bot, "OFFSET_FILE", Path("test_offset_tmp.json")), \
              patch.object(bot, "get_updates", return_value=updates), \
+             patch.object(bot, "get_me", return_value=(999, "meubot")), \
+             patch.object(bot.rag, "should_respond", return_value=should_respond), \
+             patch.object(bot.rag, "answer_question", return_value=rag_answer), \
              patch.object(bot, "send_telegram_message") as mock_send:
             try:
                 if initial_subscribers is not None:
@@ -256,17 +259,63 @@ class ProcessUpdatesTest(unittest.TestCase):
         self.assertEqual(subscribers, set())
         mock_send.assert_called_once()
 
-    def test_unknown_text_does_not_subscribe_or_reply(self):
+    def test_unknown_text_does_not_subscribe_or_reply_when_not_eligible_for_chat(self):
         updates = [{"update_id": 3, "message": {"chat": {"id": 999}, "text": "oi tudo bem?"}}]
-        mock_send, subscribers = self._run(updates)
+        mock_send, subscribers = self._run(updates, should_respond=False)
         self.assertEqual(subscribers, set())
         mock_send.assert_not_called()
+
+    def test_dispatches_eligible_message_to_rag_and_replies(self):
+        updates = [{
+            "update_id": 4,
+            "message": {
+                "message_id": 42,
+                "chat": {"id": 555, "type": "private"},
+                "text": "qual o tema do blog?",
+            },
+        }]
+        mock_send, _ = self._run(updates, should_respond=True, rag_answer="Resposta gerada.")
+        mock_send.assert_called_once()
+        args, kwargs = mock_send.call_args
+        self.assertEqual(args[0], 555)
+        self.assertIn("Resposta gerada.", args[1])
+        self.assertEqual(kwargs.get("reply_to_message_id"), 42)
+
+    def test_chat_reply_html_escapes_the_answer(self):
+        updates = [{
+            "update_id": 4,
+            "message": {"message_id": 42, "chat": {"id": 555, "type": "private"}, "text": "pergunta"},
+        }]
+        mock_send, _ = self._run(updates, should_respond=True, rag_answer="Menos que <isso> & mais.")
+        args, _ = mock_send.call_args
+        self.assertIn("&lt;isso&gt;", args[1])
+        self.assertIn("&amp;", args[1])
+
+    def test_rag_failure_does_not_crash_or_reply(self):
+        updates = [{
+            "update_id": 4,
+            "message": {"message_id": 42, "chat": {"id": 555, "type": "private"}, "text": "pergunta"},
+        }]
+        with patch.object(bot, "SUBSCRIBERS_FILE", Path("test_subscribers_tmp.json")), \
+             patch.object(bot, "OFFSET_FILE", Path("test_offset_tmp.json")), \
+             patch.object(bot, "get_updates", return_value=updates), \
+             patch.object(bot, "get_me", return_value=(999, "meubot")), \
+             patch.object(bot.rag, "should_respond", return_value=True), \
+             patch.object(bot.rag, "answer_question", side_effect=Exception("boom")), \
+             patch.object(bot, "send_telegram_message") as mock_send:
+            try:
+                bot.process_updates([])
+                mock_send.assert_not_called()
+            finally:
+                bot.SUBSCRIBERS_FILE.unlink(missing_ok=True)
+                bot.OFFSET_FILE.unlink(missing_ok=True)
 
     def test_offset_advances_past_processed_updates(self):
         updates = [{"update_id": 5, "message": {"chat": {"id": 111}, "text": "/start"}}]
         with patch.object(bot, "SUBSCRIBERS_FILE", Path("test_subscribers_tmp.json")), \
              patch.object(bot, "OFFSET_FILE", Path("test_offset_tmp.json")), \
              patch.object(bot, "get_updates", return_value=updates), \
+             patch.object(bot, "get_me", return_value=(999, "meubot")), \
              patch.object(bot, "send_telegram_message"):
             try:
                 bot.process_updates([])

@@ -19,6 +19,8 @@ import feedparser
 import requests
 from dotenv import load_dotenv
 
+import rag
+
 load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -265,7 +267,7 @@ def save_offset(offset):
 # Chamadas à Bot API do Telegram
 # ---------------------------------------------------------------------------
 
-def send_telegram_message(chat_id, text):
+def send_telegram_message(chat_id, text, reply_to_message_id=None, message_thread_id=None):
     url = TELEGRAM_API_BASE.format(token=TELEGRAM_BOT_TOKEN, method="sendMessage")
     payload = {
         "chat_id": chat_id,
@@ -273,9 +275,22 @@ def send_telegram_message(chat_id, text):
         "parse_mode": "HTML",
         "disable_web_page_preview": False,
     }
+    if reply_to_message_id is not None:
+        payload["reply_to_message_id"] = reply_to_message_id
+    if message_thread_id is not None:
+        payload["message_thread_id"] = message_thread_id
     response = requests.post(url, data=payload, timeout=30)
     response.raise_for_status()
     return response.json()
+
+
+def get_me():
+    """Busca id e username do próprio bot (usado pra detectar menção/reply em grupos)."""
+    url = TELEGRAM_API_BASE.format(token=TELEGRAM_BOT_TOKEN, method="getMe")
+    response = requests.get(url, timeout=30)
+    response.raise_for_status()
+    result = response.json().get("result", {})
+    return result.get("id"), result.get("username")
 
 
 def send_telegram_photo(chat_id, photo_url, caption):
@@ -353,14 +368,48 @@ def build_recent_articles_message(entries, count=RECENT_ARTICLES_COUNT):
 # Processamento de comandos recebidos (getUpdates)
 # ---------------------------------------------------------------------------
 
+def handle_chat_message(message, bot_id, bot_username):
+    """Responde uma mensagem via RAG (chat sobre os artigos), se elegível
+    pelas regras de privado/menção/reply. Erros não derrubam o processamento
+    das demais mensagens do lote."""
+    if not rag.should_respond(message, bot_username, bot_id):
+        return
+
+    chat_id = message["chat"]["id"]
+    text = (message.get("text") or "").strip()
+    question = rag.strip_mention(text, bot_username)
+    if not question:
+        return
+
+    reply_to = message.get("reply_to_message")
+    previous_answer = None
+    if reply_to and reply_to.get("from", {}).get("id") == bot_id:
+        previous_answer = reply_to.get("text")
+
+    try:
+        answer = rag.answer_question(question, previous_answer=previous_answer)
+    except Exception as exc:
+        print(f"Falha ao responder pergunta via RAG: {exc}", file=sys.stderr)
+        return
+
+    send_telegram_message(
+        chat_id,
+        html.escape(answer),
+        reply_to_message_id=message.get("message_id"),
+        message_thread_id=message.get("message_thread_id"),
+    )
+
+
 def process_updates(feed_entries):
-    """Busca mensagens novas desde a última execução e responde aos comandos."""
+    """Busca mensagens novas desde a última execução e responde aos comandos
+    e, quando elegível, perguntas via chat/RAG sobre os artigos."""
     offset = load_offset()
     updates = get_updates(offset)
     if not updates:
         return
 
     subscribers = load_subscribers()
+    bot_id, bot_username = get_me()
     max_update_id = offset - 1
 
     for update in updates:
@@ -389,6 +438,8 @@ def process_updates(feed_entries):
             subscribers.add(chat_id)
             save_subscribers(subscribers)
             send_telegram_message(chat_id, build_start_message())
+        else:
+            handle_chat_message(message, bot_id, bot_username)
 
     save_offset(max_update_id + 1)
 
