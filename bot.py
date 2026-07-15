@@ -656,6 +656,44 @@ STREAM_UPDATE_MIN_CHARS = 120
 STREAM_UPDATE_MIN_INTERVAL_SECONDS = 0.7
 
 
+# ---------------------------------------------------------------------------
+# Trava de perguntas fora do tema em sequência
+# ---------------------------------------------------------------------------
+# O guardrail de relevância (rag.py) já nunca chama o Claude quando a
+# pergunta foge do tema — mas continua respondendo a recusa de novo a cada
+# mensagem, o que é chato pra quem insiste e também segue gastando a
+# chamada de embedding a cada vez. Depois de OFF_TOPIC_STREAK_LIMIT recusas
+# seguidas no mesmo chat, avisa uma vez e para de responder (silêncio total)
+# até a pergunta voltar a ser sobre os artigos. É estado só em memória —
+# não precisa sobreviver a um restart, o pior caso é a contagem zerar.
+OFF_TOPIC_STREAK_LIMIT = 3
+_off_topic_streaks = {}
+
+OFF_TOPIC_LOCK_MESSAGE = (
+    "😊 Percebi que as últimas perguntas fugiram dos temas dos meus artigos. "
+    "Pra não ficar recusando à toa, vou ficar quietinho por aqui até você "
+    "mandar algo relacionado a eles — pode perguntar quando quiser!"
+)
+
+
+def _apply_off_topic_lock(chat_id, answer_text):
+    """Decide o que (se algo) mandar de volta, considerando o histórico de
+    recusas por fugir do tema nesse chat. Retorna o texto a enviar, ou None
+    se a trava estiver ativa e for pra ficar em silêncio."""
+    if answer_text != rag.REFUSAL_MESSAGE:
+        _off_topic_streaks.pop(chat_id, None)
+        return answer_text
+
+    streak = _off_topic_streaks.get(chat_id, 0) + 1
+    _off_topic_streaks[chat_id] = streak
+
+    if streak == OFF_TOPIC_STREAK_LIMIT + 1:
+        return OFF_TOPIC_LOCK_MESSAGE
+    if streak > OFF_TOPIC_STREAK_LIMIT + 1:
+        return None
+    return answer_text
+
+
 def _stream_chat_reply(chat_id, question, previous_answer, draft_id, message_thread_id=None):
     """Transmite a resposta do RAG aos poucos via sendRichMessageDraft
     conforme o Claude gera o texto (só funciona em chat privado — daí ser
@@ -667,6 +705,12 @@ def _stream_chat_reply(chat_id, question, previous_answer, draft_id, message_thr
 
     for accumulated in rag.answer_question_stream(question, previous_answer=previous_answer):
         final_text = accumulated
+        if accumulated == rag.REFUSAL_MESSAGE:
+            # Recusa é sempre um único yield já completo (ver docstring de
+            # answer_question_stream) — não faz sentido "transmitir aos
+            # poucos" isso, e mandar um draft aqui vazaria a recusa mesmo
+            # que a trava abaixo decida ficar em silêncio.
+            break
         now = time.monotonic()
         has_enough_new_text = len(accumulated) - last_sent_length >= STREAM_UPDATE_MIN_CHARS
         enough_time_passed = now - last_sent_time >= STREAM_UPDATE_MIN_INTERVAL_SECONDS
@@ -681,9 +725,13 @@ def _stream_chat_reply(chat_id, question, previous_answer, draft_id, message_thr
             # streaming — a próxima tentativa (ou a mensagem final) resolve.
             print(f"Falha ao atualizar rich message draft: {_error_detail(exc)}", file=sys.stderr)
 
-    final_text = truncate_summary(final_text, max_length=rich_message.ARTICLE_HTML_MAX_LENGTH)
+    text_to_send = _apply_off_topic_lock(chat_id, final_text)
+    if text_to_send is None:
+        return
+
+    text_to_send = truncate_summary(text_to_send, max_length=rich_message.ARTICLE_HTML_MAX_LENGTH)
     send_rich_message(
-        chat_id, markdown_to_telegram_html(final_text),
+        chat_id, markdown_to_telegram_html(text_to_send),
         reply_to_message_id=draft_id, message_thread_id=message_thread_id,
     )
 
@@ -861,6 +909,10 @@ def handle_chat_message(message, bot_id, bot_username):
     except Exception as exc:
         print(f"Falha ao responder pergunta via RAG: {exc}", file=sys.stderr)
         _send_chat_fallback_error(chat_id, message)
+        return
+
+    answer = _apply_off_topic_lock(chat_id, answer)
+    if answer is None:
         return
 
     answer = truncate_summary(answer, max_length=TELEGRAM_TEXT_MAX_LENGTH)

@@ -77,6 +77,54 @@ class MarkdownToTelegramHtmlTest(unittest.TestCase):
         self.assertNotIn("<a", result)
 
 
+class ApplyOffTopicLockTest(unittest.TestCase):
+    def setUp(self):
+        bot._off_topic_streaks.clear()
+
+    def test_real_answer_passes_through_and_resets_streak(self):
+        bot._off_topic_streaks[555] = 2
+        result = bot._apply_off_topic_lock(555, "Resposta de verdade sobre os artigos.")
+        self.assertEqual(result, "Resposta de verdade sobre os artigos.")
+        self.assertNotIn(555, bot._off_topic_streaks)
+
+    def test_refusals_within_the_limit_pass_through_unchanged(self):
+        for _ in range(bot.OFF_TOPIC_STREAK_LIMIT):
+            result = bot._apply_off_topic_lock(555, bot.rag.REFUSAL_MESSAGE)
+            self.assertEqual(result, bot.rag.REFUSAL_MESSAGE)
+
+    def test_lock_message_fires_exactly_once_when_limit_is_crossed(self):
+        for _ in range(bot.OFF_TOPIC_STREAK_LIMIT):
+            bot._apply_off_topic_lock(555, bot.rag.REFUSAL_MESSAGE)
+
+        result = bot._apply_off_topic_lock(555, bot.rag.REFUSAL_MESSAGE)
+        self.assertEqual(result, bot.OFF_TOPIC_LOCK_MESSAGE)
+
+    def test_stays_silent_after_the_lock_message_already_fired(self):
+        for _ in range(bot.OFF_TOPIC_STREAK_LIMIT + 1):
+            bot._apply_off_topic_lock(555, bot.rag.REFUSAL_MESSAGE)
+
+        result = bot._apply_off_topic_lock(555, bot.rag.REFUSAL_MESSAGE)
+        self.assertIsNone(result)
+
+    def test_on_topic_answer_unlocks_and_resets(self):
+        for _ in range(bot.OFF_TOPIC_STREAK_LIMIT + 2):
+            bot._apply_off_topic_lock(555, bot.rag.REFUSAL_MESSAGE)
+
+        result = bot._apply_off_topic_lock(555, "Voltou a ser sobre os artigos.")
+        self.assertEqual(result, "Voltou a ser sobre os artigos.")
+
+        # depois de destravar, uma nova sequência de recusas recomeça do zero
+        result = bot._apply_off_topic_lock(555, bot.rag.REFUSAL_MESSAGE)
+        self.assertEqual(result, bot.rag.REFUSAL_MESSAGE)
+
+    def test_streaks_are_tracked_independently_per_chat(self):
+        for _ in range(bot.OFF_TOPIC_STREAK_LIMIT + 1):
+            bot._apply_off_topic_lock(555, bot.rag.REFUSAL_MESSAGE)
+
+        result = bot._apply_off_topic_lock(999, bot.rag.REFUSAL_MESSAGE)
+        self.assertEqual(result, bot.rag.REFUSAL_MESSAGE)
+
+
 class ExtractImageUrlTest(unittest.TestCase):
     def test_prefers_media_content(self):
         entry = FakeEntry(media_content=[{"url": "https://example.com/capa.jpg"}])
@@ -651,6 +699,69 @@ class HandleChatMessageArticleSendTest(unittest.TestCase):
             mock_send_article, mock_send_rich, mock_send = self._run("pergunta ambígua qualquer")
         mock_send_article.assert_not_called()
         mock_send_rich.assert_called_once()
+
+
+class OffTopicLockIntegrationTest(unittest.TestCase):
+    """Testa a trava ponta a ponta via process_updates, tanto no caminho de
+    grupo (bloqueante) quanto no de privado (streaming)."""
+
+    def setUp(self):
+        bot._off_topic_streaks.clear()
+
+    def test_group_chat_locks_after_streak_limit_and_stays_silent(self):
+        updates = [
+            {"update_id": i, "message": {
+                "message_id": i, "chat": {"id": 777, "type": "group"},
+                "text": "@meubot pergunta fora do tema",
+            }}
+            for i in range(1, bot.OFF_TOPIC_STREAK_LIMIT + 3)
+        ]
+        with patch.object(bot, "SUBSCRIBERS_FILE", Path("test_subscribers_tmp.json")), \
+             patch.object(bot, "OFFSET_FILE", Path("test_offset_tmp.json")), \
+             patch.object(bot, "get_updates", return_value=updates), \
+             patch.object(bot, "get_me", return_value=(999, "meubot")), \
+             patch.object(bot.rag, "should_respond", return_value=True), \
+             patch.object(bot.rag, "classify_send_intent", return_value=False), \
+             patch.object(bot.rag, "answer_question", return_value=bot.rag.REFUSAL_MESSAGE), \
+             patch.object(bot, "send_telegram_message") as mock_send:
+            try:
+                bot.process_updates([])
+            finally:
+                bot.SUBSCRIBERS_FILE.unlink(missing_ok=True)
+                bot.OFFSET_FILE.unlink(missing_ok=True)
+
+        texts_sent = [call.args[1] for call in mock_send.call_args_list]
+        self.assertEqual(texts_sent.count(bot.rag.REFUSAL_MESSAGE), bot.OFF_TOPIC_STREAK_LIMIT)
+        self.assertEqual(texts_sent.count(bot.OFF_TOPIC_LOCK_MESSAGE), 1)
+        self.assertEqual(len(texts_sent), bot.OFF_TOPIC_STREAK_LIMIT + 1)
+
+    def test_private_chat_locks_after_streak_limit_and_stays_silent(self):
+        updates = [
+            {"update_id": i, "message": {
+                "message_id": i, "chat": {"id": 555, "type": "private"},
+                "text": "pergunta fora do tema",
+            }}
+            for i in range(1, bot.OFF_TOPIC_STREAK_LIMIT + 3)
+        ]
+        with patch.object(bot, "SUBSCRIBERS_FILE", Path("test_subscribers_tmp.json")), \
+             patch.object(bot, "OFFSET_FILE", Path("test_offset_tmp.json")), \
+             patch.object(bot, "get_updates", return_value=updates), \
+             patch.object(bot, "get_me", return_value=(999, "meubot")), \
+             patch.object(bot.rag, "should_respond", return_value=True), \
+             patch.object(bot.rag, "classify_send_intent", return_value=False), \
+             patch.object(bot.rag, "answer_question_stream", side_effect=lambda *a, **kw: iter([bot.rag.REFUSAL_MESSAGE])), \
+             patch.object(bot, "send_rich_message_draft"), \
+             patch.object(bot, "send_rich_message") as mock_send_rich:
+            try:
+                bot.process_updates([])
+            finally:
+                bot.SUBSCRIBERS_FILE.unlink(missing_ok=True)
+                bot.OFFSET_FILE.unlink(missing_ok=True)
+
+        texts_sent = [call.args[1] for call in mock_send_rich.call_args_list]
+        self.assertEqual(texts_sent.count(bot.rag.REFUSAL_MESSAGE), bot.OFF_TOPIC_STREAK_LIMIT)
+        self.assertEqual(texts_sent.count(bot.OFF_TOPIC_LOCK_MESSAGE), 1)
+        self.assertEqual(len(texts_sent), bot.OFF_TOPIC_STREAK_LIMIT + 1)
 
 
 class GetUpdatesTest(unittest.TestCase):
