@@ -31,6 +31,11 @@ load_dotenv()
 
 BASE_DIR = Path(__file__).parent
 ARTICLES_INDEX_FILE = BASE_DIR / "articles_index.json"
+# Catálogo leve (só título+URL, sem embeddings) derivado do índice completo
+# — a vitrine de artigos do Mini App lê esse arquivo pequeno em vez do
+# articles_index.json inteiro (bem mais pesado, por causa dos embeddings),
+# pra não pagar esse custo a cada abertura do Mini App.
+ARTICLES_CATALOG_FILE = BASE_DIR / "articles_catalog.json"
 
 SITEMAP_CANDIDATES = ["/sitemap.xml", "/sitemap/sitemap.xml"]
 POST_URL_RE = re.compile(r"/p/[^/?#]+/?$")
@@ -104,6 +109,20 @@ def already_indexed_urls(index):
     return {chunk["url"] for chunk in index}
 
 
+def build_articles_catalog(index):
+    """Deduplica o índice completo por URL e devolve só título+URL de cada
+    artigo, ordenado por título — o suficiente pra vitrine do Mini App."""
+    seen = {}
+    for chunk in index:
+        url = chunk.get("url", "")
+        if url and url not in seen:
+            seen[url] = chunk.get("titulo", "")
+    return sorted(
+        ({"titulo": titulo, "url": url} for url, titulo in seen.items()),
+        key=lambda article: article["titulo"].lower(),
+    )
+
+
 def index_article(base_url, post_url, embed_client):
     title, body_html = fetch_post(base_url, post_url)
     full_text = strip_html(body_html)
@@ -146,24 +165,28 @@ def main():
     new_urls = [url for url in post_urls if url not in indexed_urls]
     print(f"{len(new_urls)} artigos novos pra indexar ({len(indexed_urls)} já indexados).")
 
-    if not new_urls:
-        print("Nada novo pra fazer.")
-        return
+    if new_urls:
+        embed_client = rag._voyage_client()
+        for i, post_url in enumerate(new_urls, start=1):
+            print(f"[{i}/{len(new_urls)}] Indexando {post_url}...")
+            try:
+                new_chunks = index_article(base_url, post_url, embed_client)
+            except Exception as exc:
+                print(f"Erro ao indexar {post_url}: {exc}", file=sys.stderr)
+                continue
+            index.extend(new_chunks)
+            with open(ARTICLES_INDEX_FILE, "w", encoding="utf-8") as f:
+                json.dump(index, f, ensure_ascii=False)
+        print(f"Concluído. Índice agora tem {len(index)} chunks em {ARTICLES_INDEX_FILE}.")
+    else:
+        print("Nada novo pra indexar.")
 
-    embed_client = rag._voyage_client()
-
-    for i, post_url in enumerate(new_urls, start=1):
-        print(f"[{i}/{len(new_urls)}] Indexando {post_url}...")
-        try:
-            new_chunks = index_article(base_url, post_url, embed_client)
-        except Exception as exc:
-            print(f"Erro ao indexar {post_url}: {exc}", file=sys.stderr)
-            continue
-        index.extend(new_chunks)
-        with open(ARTICLES_INDEX_FILE, "w", encoding="utf-8") as f:
-            json.dump(index, f, ensure_ascii=False)
-
-    print(f"Concluído. Índice agora tem {len(index)} chunks em {ARTICLES_INDEX_FILE}.")
+    # Regenerado sempre (mesmo sem artigo novo), pra cobrir o caso de rodar
+    # essa versão do script pela primeira vez sobre um índice que já existia.
+    catalog = build_articles_catalog(index)
+    with open(ARTICLES_CATALOG_FILE, "w", encoding="utf-8") as f:
+        json.dump(catalog, f, ensure_ascii=False, indent=2)
+    print(f"Catálogo da vitrine atualizado: {len(catalog)} artigos em {ARTICLES_CATALOG_FILE}.")
 
 
 if __name__ == "__main__":

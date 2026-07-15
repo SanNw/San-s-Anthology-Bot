@@ -37,5 +37,22 @@ class RateLimitedEmbedTest(unittest.TestCase):
         mock_sleep.assert_any_call(index_articles.EMBED_MIN_INTERVAL_SECONDS)
 
 
+class BuildArticlesCatalogTest(unittest.TestCase):
+    def test_deduplicates_by_url_and_sorts_by_title(self):
+        index = [
+            {"url": "https://x.com/p/b", "titulo": "Beta", "texto": "...", "embedding": [1]},
+            {"url": "https://x.com/p/b", "titulo": "Beta", "texto": "...(chunk 2)", "embedding": [2]},
+            {"url": "https://x.com/p/a", "titulo": "Alfa", "texto": "...", "embedding": [3]},
+        ]
+        catalog = index_articles.build_articles_catalog(index)
+        self.assertEqual(catalog, [
+            {"titulo": "Alfa", "url": "https://x.com/p/a"},
+            {"titulo": "Beta", "url": "https://x.com/p/b"},
+        ])
+
+    def test_empty_index_returns_empty_catalog(self):
+        self.assertEqual(index_articles.build_articles_catalog([]), [])
+
+
 if __name__ == "__main__":
     unittest.main()

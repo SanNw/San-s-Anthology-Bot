@@ -23,6 +23,7 @@ import feedparser
 import requests
 from dotenv import load_dotenv
 
+import miniapp
 import rag
 import rich_message
 
@@ -48,6 +49,10 @@ OFFSET_FILE = DATA_DIR / "update_offset.json"
 # é só texto (nada de embeddings), então é bem mais leve que articles_index.json.
 ARTICLE_CONTENT_FILE = DATA_DIR / "article_content.json"
 STATE_FILENAMES = ("posted.json", "subscribers.json", "update_offset.json", "article_content.json")
+# Catálogo leve (título+URL) da vitrine de artigos do Mini App — gerado por
+# index_articles.py e versionado no repo, como articles_index.json; não é
+# "estado" do bot, então não entra em STATE_FILENAMES.
+ARTICLES_CATALOG_FILE = BASE_DIR / "articles_catalog.json"
 
 SUMMARY_MAX_LENGTH = 500
 RECENT_ARTICLES_COUNT = 5
@@ -352,6 +357,10 @@ def save_article_content(content_by_short_id):
     _save_json(ARTICLE_CONTENT_FILE, content_by_short_id)
 
 
+def load_articles_catalog():
+    return _load_json(ARTICLES_CATALOG_FILE, [])
+
+
 def article_short_id(entry_identifier):
     """ID curto e estável pro callback_data do botão 'Ler artigo completo'
     (limite de 64 bytes do Telegram não deixa usar a URL do artigo direto)."""
@@ -524,6 +533,19 @@ def set_webhook(url):
     payload = {"url": url, "allowed_updates": json.dumps(["message", "callback_query"])}
     if TELEGRAM_WEBHOOK_SECRET:
         payload["secret_token"] = TELEGRAM_WEBHOOK_SECRET
+    response = requests.post(api_url, data=payload, timeout=30)
+    response.raise_for_status()
+    return response.json()
+
+
+def set_chat_menu_button(web_app_url):
+    """Registra o botão de menu persistente (ícone ao lado do campo de
+    mensagem, em chat privado) que abre o Mini App. Chamado uma vez ao
+    subir o servidor, junto com o webhook."""
+    api_url = TELEGRAM_API_BASE.format(token=TELEGRAM_BOT_TOKEN, method="setChatMenuButton")
+    payload = {"menu_button": json.dumps({
+        "type": "web_app", "text": "Artigos", "web_app": {"url": web_app_url},
+    })}
     response = requests.post(api_url, data=payload, timeout=30)
     response.raise_for_status()
     return response.json()
@@ -1174,8 +1196,21 @@ def _refresh_feed_and_sync_state(force=False):
             _webhook_last_state_sync = now
 
 
+MINIAPP_PATH = "/miniapp"
+MINIAPP_ARTICLES_PATH = "/miniapp/articles.json"
+MINIAPP_CHAT_PATH = "/miniapp/chat"
+
+
 class _WebhookRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self):
+        if self.path == MINIAPP_PATH:
+            self._respond(200, miniapp.PAGE_HTML.encode("utf-8"), content_type="text/html; charset=utf-8")
+            return
+        if self.path == MINIAPP_ARTICLES_PATH:
+            body = json.dumps(load_articles_catalog(), ensure_ascii=False).encode("utf-8")
+            self._respond(200, body, content_type="application/json")
+            return
+
         try:
             _refresh_feed_and_sync_state()
         except Exception as exc:
@@ -1183,6 +1218,10 @@ class _WebhookRequestHandler(BaseHTTPRequestHandler):
         self._respond(200, b"ok")
 
     def do_POST(self):
+        if self.path == MINIAPP_CHAT_PATH:
+            self._handle_miniapp_chat()
+            return
+
         if self.path != WEBHOOK_PATH:
             self._respond(404, b"not found")
             return
@@ -1206,9 +1245,45 @@ class _WebhookRequestHandler(BaseHTTPRequestHandler):
 
         self._respond(200, b"ok")
 
-    def _respond(self, status, body):
+    def _handle_miniapp_chat(self):
+        """Endpoint de chat do Mini App: valida o initData (garante que a
+        pergunta veio de dentro do Telegram, não de qualquer um batendo
+        nesse endpoint) e devolve a resposta do RAG em JSON — sem streaming
+        (o streaming via sendRichMessageDraft é só pro chat dentro do
+        Telegram; aqui é uma requisição HTTP comum, pergunta -> resposta)."""
+        length = int(self.headers.get("Content-Length") or 0)
+        body = self.rfile.read(length) if length else b"{}"
+        try:
+            payload = json.loads(body or b"{}")
+        except json.JSONDecodeError:
+            self._respond_json(400, {"error": "corpo da requisição inválido"})
+            return
+
+        user = miniapp.validate_init_data(payload.get("initData", ""), TELEGRAM_BOT_TOKEN)
+        if user is None:
+            self._respond_json(401, {"error": "initData inválido ou expirado"})
+            return
+
+        question = (payload.get("question") or "").strip()
+        if not question:
+            self._respond_json(400, {"error": "pergunta vazia"})
+            return
+
+        try:
+            answer = rag.answer_question(question, previous_answer=payload.get("previous_answer"))
+        except Exception as exc:
+            print(f"Falha ao responder pergunta do Mini App: {exc}", file=sys.stderr)
+            self._respond_json(502, {"error": "não consegui responder agora"})
+            return
+
+        self._respond_json(200, {"answer": answer})
+
+    def _respond_json(self, status, data):
+        self._respond(status, json.dumps(data, ensure_ascii=False).encode("utf-8"), content_type="application/json")
+
+    def _respond(self, status, body, content_type="text/plain"):
         self.send_response(status)
-        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Type", content_type)
         self.end_headers()
         self.wfile.write(body)
 
@@ -1229,6 +1304,13 @@ def run_webhook_server():
         print(f"Webhook registrado: {webhook_url}")
     except requests.RequestException as exc:
         print(f"Falha ao registrar o webhook: {exc}", file=sys.stderr)
+
+    try:
+        miniapp_url = f"{PUBLIC_URL.rstrip('/')}{MINIAPP_PATH}"
+        set_chat_menu_button(miniapp_url)
+        print(f"Botão de menu do Mini App registrado: {miniapp_url}")
+    except requests.RequestException as exc:
+        print(f"Falha ao registrar o botão de menu do Mini App: {exc}", file=sys.stderr)
 
     _refresh_feed_and_sync_state(force=True)
 

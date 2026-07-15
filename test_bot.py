@@ -1,21 +1,34 @@
 """Testes básicos das funções de parsing do bot (sem chamar a API do Telegram)."""
 
 import gzip
+import hashlib
+import hmac
 import http.client
 import io
 import json
 import socket
 import threading
+import time
 import unittest
 import urllib.error
 import zlib
 from pathlib import Path
 from unittest.mock import Mock, patch
+from urllib.parse import urlencode
 
 import requests
 
 import bot
 import rich_message
+
+
+def _build_init_data(fields, bot_token):
+    """Monta uma string Telegram.WebApp.initData genuína (mesmo algoritmo
+    de miniapp.validate_init_data) pra testar o endpoint de chat do Mini App."""
+    data_check_string = "\n".join(f"{key}={value}" for key, value in sorted(fields.items()))
+    secret_key = hmac.new(b"WebAppData", bot_token.encode("utf-8"), hashlib.sha256).digest()
+    computed_hash = hmac.new(secret_key, data_check_string.encode("utf-8"), hashlib.sha256).hexdigest()
+    return urlencode({**fields, "hash": computed_hash})
 
 
 class FakeEntry(dict):
@@ -946,6 +959,66 @@ class WebhookServerTest(unittest.TestCase):
         mock_dispatch.assert_called_once()
         args = mock_dispatch.call_args[0]
         self.assertEqual(args[0], update["message"])
+
+    def test_get_miniapp_serves_the_page_html(self):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        conn.request("GET", bot.MINIAPP_PATH)
+        response = conn.getresponse()
+        body = response.read()
+        conn.close()
+        self.assertEqual(response.status, 200)
+        self.assertIn("text/html", response.getheader("Content-Type"))
+        self.assertIn(b"telegram-web-app.js", body)
+
+    def test_get_miniapp_articles_serves_the_catalog(self):
+        with patch.object(bot, "load_articles_catalog", return_value=[{"titulo": "T", "url": "https://x.com/p/t"}]):
+            conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+            conn.request("GET", bot.MINIAPP_ARTICLES_PATH)
+            response = conn.getresponse()
+            body = response.read()
+            conn.close()
+        self.assertEqual(response.status, 200)
+        self.assertEqual(json.loads(body), [{"titulo": "T", "url": "https://x.com/p/t"}])
+
+    def test_post_miniapp_chat_rejects_invalid_init_data(self):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        payload = json.dumps({"initData": "hash=adulterado&auth_date=123", "question": "oi"}).encode()
+        conn.request("POST", bot.MINIAPP_CHAT_PATH, body=payload, headers={"Content-Type": "application/json"})
+        response = conn.getresponse()
+        body = json.loads(response.read())
+        conn.close()
+        self.assertEqual(response.status, 401)
+        self.assertIn("error", body)
+
+    def test_post_miniapp_chat_returns_answer_for_valid_request(self):
+        init_data = _build_init_data(
+            {"auth_date": str(int(time.time())), "user": json.dumps({"id": 1})},
+            bot.TELEGRAM_BOT_TOKEN,
+        )
+        payload = json.dumps({"initData": init_data, "question": "qual o tema do blog?"}).encode()
+        with patch.object(bot.rag, "answer_question", return_value="Resposta do RAG.") as mock_answer:
+            conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+            conn.request("POST", bot.MINIAPP_CHAT_PATH, body=payload, headers={"Content-Type": "application/json"})
+            response = conn.getresponse()
+            body = json.loads(response.read())
+            conn.close()
+        self.assertEqual(response.status, 200)
+        self.assertEqual(body, {"answer": "Resposta do RAG."})
+        mock_answer.assert_called_once()
+
+    def test_post_miniapp_chat_rejects_empty_question(self):
+        init_data = _build_init_data(
+            {"auth_date": str(int(time.time())), "user": json.dumps({"id": 1})},
+            bot.TELEGRAM_BOT_TOKEN,
+        )
+        payload = json.dumps({"initData": init_data, "question": "   "}).encode()
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        conn.request("POST", bot.MINIAPP_CHAT_PATH, body=payload, headers={"Content-Type": "application/json"})
+        response = conn.getresponse()
+        body = json.loads(response.read())
+        conn.close()
+        self.assertEqual(response.status, 400)
+        self.assertIn("error", body)
 
 
 if __name__ == "__main__":

@@ -52,6 +52,19 @@ Em **chat privado**, a resposta do chat/RAG é transmitida em partes conforme o 
 - **Em grupo** (menção ou reply ao bot), o streaming não é usado — `sendRichMessageDraft` só funciona em chat privado (ver a doc do método). O fluxo continua sendo o `sendMessage` de sempre, com `rag.answer_question` (sem streaming).
 - Falha em uma atualização de draft não aborta a resposta (só perde aquela atualização intermediária); falha na chamada final cai no mesmo fallback de erro amigável usado pro resto do chat.
 
+### Mini App (https://core.telegram.org/bots/webapps)
+
+O bot tem um Mini App — uma página web que abre dentro do próprio Telegram, com duas abas: **vitrine de artigos** (busca por título entre os 121 indexados) e **chat** (a mesma IA do bot, numa interface de página em vez de bolhas de mensagem). Servido pelo mesmo Web Service do Render que já roda o bot, sem serviço novo.
+
+- `miniapp.py` guarda a página inteira (HTML/CSS/JS autocontidos, sem build step) e a validação de `initData` — o SDK `telegram-web-app.js` injeta variáveis de tema (`--tg-theme-*`) que a página usa direto, então ela já nasce no tema claro/escuro que a pessoa usa no Telegram.
+- `bot.py` serve três rotas novas no mesmo servidor HTTP do webhook: `GET /miniapp` (a página), `GET /miniapp/articles.json` (a vitrine, lendo `articles_catalog.json`) e `POST /miniapp/chat` (o chat, `{initData, question, previous_answer?}` → `{answer}`).
+- **`articles_catalog.json`**: lista leve (só título+URL, sem embeddings) derivada do `articles_index.json` completo por `index_articles.py` — a vitrine não precisa carregar o índice de 18MB a cada abertura do Mini App. Regenerado toda vez que `index_articles.py` roda, mesmo sem artigo novo pra indexar.
+- **Validação de `initData`**: o chat do Mini App exige que a requisição venha genuinamente do Telegram — `miniapp.validate_init_data` confere o HMAC-SHA-256 contra o `TELEGRAM_BOT_TOKEN` (ver "Validating data received via the Mini App" na doc) e rejeita dado adulterado ou com mais de 24h. Sem isso, qualquer um poderia bater direto no endpoint e gastar chamadas à API do Claude.
+- **Sem streaming**: o chat do Mini App é pergunta → uma resposta só em JSON (mais simples que replicar o SSE/polling do streaming do Telegram numa segunda interface). A trava de recusas em sequência (acima) também não se aplica aqui — é um modelo de requisição/resposta, não uma conversa contínua como no Telegram.
+- **Botão de menu**: `set_chat_menu_button` registra o botão de menu persistente (ícone ao lado do campo de mensagem, em chat privado) apontando pro `/miniapp` — chamado uma vez ao subir o servidor, junto com o webhook.
+
+Testar localmente exige HTTPS e abrir de dentro do Telegram de verdade (o Mini App não roda como uma aba comum de navegador — falta o `window.Telegram.WebApp`). Pra testar antes de fazer deploy: exponha o `python bot.py` local via [ngrok](https://ngrok.com) (`ngrok http 10000`), registre a URL `https://algo.ngrok.io/miniapp` no BotFather (`/mybots` → seu bot → **Bot Settings** → **Menu Button**), e abra o bot no app do Telegram (celular ou desktop) pra ver o Mini App de verdade. Os testes automatizados (`test_miniapp.py`, mais os de rota em `test_bot.py`) cobrem a validação de `initData` e as três rotas sem precisar disso.
+
 ### Comandos do bot
 
 | Comando | O que faz |
@@ -128,7 +141,7 @@ python bot.py
 Para rodar os testes:
 
 ```bash
-python -m unittest test_bot.py test_rag.py test_rich_message.py -v
+python -m unittest test_bot.py test_rag.py test_rich_message.py test_miniapp.py test_index_articles.py -v
 ```
 
 ## 5. Indexar os artigos (RAG)
@@ -184,13 +197,16 @@ Depois de gerar/atualizar o `articles_index.json` localmente (seção 5), **comm
 ## Estrutura do projeto
 
 ```
-bot.py                    # script principal: modo webhook (Render) ou polling (local), publica artigos, comandos e dispatch do chat/RAG
+bot.py                    # script principal: modo webhook (Render) ou polling (local), publica artigos, comandos, dispatch do chat/RAG e rotas do Mini App
 rag.py                    # busca por similaridade, guardrail de escopo e chamada à API do Claude
 rich_message.py            # sanitiza HTML de artigo pro sendRichMessage (botão "Ler artigo completo")
-index_articles.py         # indexação (sob demanda) do texto completo dos artigos pro RAG
-test_bot.py                # testes das funções de parsing, comandos, dispatch de chat, callback_query e do servidor webhook
+miniapp.py                  # página do Mini App (HTML/CSS/JS autocontidos) e validação de initData
+index_articles.py         # indexação (sob demanda) do texto completo dos artigos pro RAG + catálogo da vitrine
+test_bot.py                # testes das funções de parsing, comandos, dispatch de chat, callback_query, servidor webhook e rotas do Mini App
 test_rag.py                # testes de chunking, similaridade de cosseno e guardrail do RAG
 test_rich_message.py       # testes do sanitizador de HTML e do construtor do artigo completo
+test_miniapp.py             # testes da validação de initData do Mini App
+test_index_articles.py      # testes do rate limit de indexação e do catálogo da vitrine
 requirements.txt           # dependências (feedparser, requests, python-dotenv, anthropic, voyageai, numpy)
 .env.example                # modelo das variáveis de ambiente
 render.yaml                 # Blueprint do Render (Web Service free)
@@ -199,4 +215,5 @@ subscribers.json            # chat_ids inscritos para receber artigos no privado
 update_offset.json          # só usado no modo polling local; irrelevante no webhook (idem)
 article_content.json        # HTML completo de cada artigo publicado, pro botão "Ler artigo completo" (idem)
 articles_index.json         # chunks + embeddings dos artigos, gerado por index_articles.py (versionado)
+articles_catalog.json       # título+URL de cada artigo (sem embeddings), pra vitrine do Mini App (versionado)
 ```
