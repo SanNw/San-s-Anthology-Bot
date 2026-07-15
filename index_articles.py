@@ -9,11 +9,13 @@ pulados (não recomputa embeddings do que já foi indexado)."""
 import json
 import re
 import sys
+import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from urllib.parse import urljoin
 
 from dotenv import load_dotenv
+from voyageai.error import RateLimitError
 
 import rag
 from bot import SUBSTACK_RSS_URL, FETCH_HEADERS, _fetch_raw, decompress_response, strip_html
@@ -30,6 +32,27 @@ POST_URL_RE = re.compile(r"/p/[^/?#]+/?$")
 SITEMAP_NS = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
 
 EMBED_BATCH_SIZE = 32
+
+# Sem cartão cadastrado, a Voyage AI limita a conta a 3 requisições/minuto.
+# Espaçamos as chamadas nesse ritmo (com margem) pra não estourar o limite,
+# em vez de deixar a exceção de rate limit derrubar cada artigo na primeira
+# tentativa.
+EMBED_MIN_INTERVAL_SECONDS = 21
+_last_embed_call_at = [0.0]
+
+
+def _rate_limited_embed(embed_client, batch):
+    wait = EMBED_MIN_INTERVAL_SECONDS - (time.monotonic() - _last_embed_call_at[0])
+    if wait > 0:
+        time.sleep(wait)
+    try:
+        result = embed_client.embed(batch, model=rag.EMBEDDING_MODEL, input_type="document")
+    except RateLimitError:
+        time.sleep(EMBED_MIN_INTERVAL_SECONDS)
+        result = embed_client.embed(batch, model=rag.EMBEDDING_MODEL, input_type="document")
+    finally:
+        _last_embed_call_at[0] = time.monotonic()
+    return result
 
 
 def substack_base_url():
@@ -127,7 +150,7 @@ def index_article(base_url, post_url, embed_client):
     embeddings = []
     for start in range(0, len(chunks), EMBED_BATCH_SIZE):
         batch = chunks[start:start + EMBED_BATCH_SIZE]
-        result = embed_client.embed(batch, model=rag.EMBEDDING_MODEL, input_type="document")
+        result = _rate_limited_embed(embed_client, batch)
         embeddings.extend(result.embeddings)
 
     slug = slug_from_url(post_url)
