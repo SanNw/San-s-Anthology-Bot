@@ -1,0 +1,43 @@
+name: Publicar artigos do Substack no Telegram
+
+on:
+  schedule:
+    - cron: "0 * * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Instalar dependências
+        run: pip install -r requirements.txt
+
+      - name: Rodar bot
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
+          SUBSTACK_RSS_URL: ${{ secrets.SUBSTACK_RSS_URL }}
+        run: python bot.py
+
+      - name: Commit e push do posted.json
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -f posted.json
+          if ! git diff --cached --quiet; then
+            git commit -m "Atualiza posted.json [skip ci]"
+            git push
+          else
+            echo "Nenhuma mudança em posted.json."
+          fi
