@@ -138,11 +138,52 @@ class _RichHtmlSanitizer(HTMLParser):
         return "".join(self.out)
 
 
+# O editor do Substack gera notas de rodapé nesse formato bem específico:
+#   <div class="footnote" data-component-name="FootnoteToDOM">
+#     <a id="footnote-1" href="#footnote-anchor-1" class="footnote-number">1</a>
+#     <div class="footnote-content"><p>Texto da nota.</p></div>
+#   </div>
+# Sem tratamento especial, o <div> vira texto solto (nosso sanitizador
+# genérico descarta tags desconhecidas mas mantém o conteúdo) e o <p> força
+# uma quebra de linha entre o número e o texto — exatamente o problema
+# relatado (número numa linha, texto na de baixo). Reescrevemos isso ANTES
+# do sanitizador genérico rodar, pra virar um <footer> só, com o número e o
+# texto na mesma linha, aproveitando a tag de rodapé que o rich message do
+# Telegram já suporta.
+_FOOTNOTE_BLOCK_RE = re.compile(
+    r'<div[^>]*class="[^"]*\bfootnote\b(?!-)[^"]*"[^>]*>'
+    r'\s*(<a\b[^>]*>)(.*?)</a>'
+    r'\s*<div[^>]*class="[^"]*\bfootnote-content\b[^"]*"[^>]*>(.*?)</div>'
+    r'\s*</div>',
+    re.IGNORECASE | re.DOTALL,
+)
+_ID_ATTR_RE = re.compile(r'\bid="([^"]+)"', re.IGNORECASE)
+_PARAGRAPH_TAG_RE = re.compile(r"</?p\b[^>]*>", re.IGNORECASE)
+
+
+def _rewrite_footnotes_as_footer(raw_html):
+    def replace(match):
+        number_tag_open, number_text, content = match.groups()
+        id_match = _ID_ATTR_RE.search(number_tag_open)
+        # <a name="..."> é como o Telegram cria uma âncora navegável (ver
+        # "Rich HTML style" na doc) — a referência inline no corpo do
+        # artigo (<a href="#footnote-1">1</a>) já aponta pra esse mesmo id
+        # que o Substack usa, então só precisamos preservá-lo como name.
+        anchor = f'<a name="{id_match.group(1)}"></a>' if id_match else ""
+        # Achata os <p> do conteúdo da nota — ela deve ficar na mesma linha
+        # do número, não como parágrafo à parte.
+        flat_content = _PARAGRAPH_TAG_RE.sub(" ", content).strip()
+        return f"<footer>{anchor}{number_text}. {flat_content}</footer>"
+
+    return _FOOTNOTE_BLOCK_RE.sub(replace, raw_html)
+
+
 def sanitize_article_html(raw_html):
     """Converte o HTML bruto de um artigo (campo content/summary do feed)
     para o subconjunto suportado por InputRichMessage.html."""
+    raw_html = _rewrite_footnotes_as_footer(raw_html or "")
     parser = _RichHtmlSanitizer()
-    parser.feed(raw_html or "")
+    parser.feed(raw_html)
     return parser.get_html()
 
 

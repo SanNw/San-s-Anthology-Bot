@@ -58,6 +58,35 @@ class SanitizeArticleHtmlTest(unittest.TestCase):
         result = rich_message.sanitize_article_html(raw)
         self.assertEqual(result, "<p>Parágrafo sem fechar</p>")
 
+    def test_footnote_number_and_text_stay_on_the_same_footer_line(self):
+        # Formato real gerado pelo editor do Substack: sem o tratamento
+        # especial, o <div> vira texto solto e o <p> força o número numa
+        # linha e o texto da nota na de baixo — era esse o bug relatado.
+        raw = (
+            '<p>Uma frase com nota.<a class="footnote-anchor" id="footnote-anchor-1" '
+            'href="#footnote-1" target="_self">1</a></p>'
+            '<div class="footnote" data-component-name="FootnoteToDOM">'
+            '<a id="footnote-1" href="#footnote-anchor-1" class="footnote-number" '
+            'contenteditable="false" target="_self">1</a>'
+            '<div class="footnote-content"><p>Texto da nota aqui.</p></div>'
+            "</div>"
+        )
+        result = rich_message.sanitize_article_html(raw)
+        self.assertIn('<a href="#footnote-1">1</a>', result)
+        self.assertIn('<footer><a name="footnote-1"></a>1. Texto da nota aqui.</footer>', result)
+        self.assertNotIn("<div", result)
+
+    def test_multiple_footnotes_each_become_their_own_footer(self):
+        def footnote_div(n):
+            return (
+                f'<div class="footnote"><a id="footnote-{n}" class="footnote-number">{n}</a>'
+                f'<div class="footnote-content"><p>Nota número {n}.</p></div></div>'
+            )
+        raw = footnote_div(1) + footnote_div(2)
+        result = rich_message.sanitize_article_html(raw)
+        self.assertIn('<footer><a name="footnote-1"></a>1. Nota número 1.</footer>', result)
+        self.assertIn('<footer><a name="footnote-2"></a>2. Nota número 2.</footer>', result)
+
 
 class BuildFullArticleHtmlTest(unittest.TestCase):
     def test_includes_title_body_and_substack_link(self):
