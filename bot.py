@@ -33,6 +33,12 @@ TELEGRAM_API_BASE = "https://api.telegram.org/bot{token}/{method}"
 TAG_RE = re.compile(r"<[^>]+>")
 IMG_SRC_RE = re.compile(r'<img[^>]+src=["\']([^"\']+)["\']', re.IGNORECASE)
 
+# Caracteres de controle proibidos pela especificação XML 1.0; feeds do Substack
+# às vezes carregam algum (colado de Word/Google Docs) e quebram o parser estrito.
+INVALID_XML_CHARS_RE = re.compile(rb"[\x00-\x08\x0B\x0C\x0E-\x1F]")
+
+USER_AGENT = "Mozilla/5.0 (compatible; SansAnthologyBot/1.0; +https://san55.substack.com/)"
+
 
 # ---------------------------------------------------------------------------
 # Parsing de artigos
@@ -118,6 +124,18 @@ def extract_categories(entries):
 
 def entry_id(entry):
     return entry.get("id") or entry.get("link")
+
+
+def sanitize_xml_bytes(data):
+    """Remove bytes de controle inválidos em XML 1.0 que quebram o parser estrito."""
+    return INVALID_XML_CHARS_RE.sub(b"", data)
+
+
+def fetch_feed(url):
+    """Busca o RSS manualmente e sanitiza o XML antes de repassar pro feedparser."""
+    response = requests.get(url, timeout=30, headers={"User-Agent": USER_AGENT})
+    response.raise_for_status()
+    return feedparser.parse(sanitize_xml_bytes(response.content))
 
 
 # ---------------------------------------------------------------------------
@@ -324,7 +342,12 @@ def main():
         )
         sys.exit(1)
 
-    feed = feedparser.parse(SUBSTACK_RSS_URL)
+    try:
+        feed = fetch_feed(SUBSTACK_RSS_URL)
+    except requests.RequestException as exc:
+        print(f"Erro ao buscar o feed RSS: {exc}", file=sys.stderr)
+        sys.exit(1)
+
     if feed.bozo and not feed.entries:
         print(f"Erro ao ler o feed RSS: {feed.bozo_exception}", file=sys.stderr)
         sys.exit(1)
