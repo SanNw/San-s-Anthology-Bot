@@ -7,6 +7,8 @@ import os
 import re
 import sys
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 import feedparser
@@ -37,7 +39,9 @@ IMG_SRC_RE = re.compile(r'<img[^>]+src=["\']([^"\']+)["\']', re.IGNORECASE)
 # às vezes carregam algum (colado de Word/Google Docs) e quebram o parser estrito.
 INVALID_XML_CHARS_RE = re.compile(rb"[\x00-\x08\x0B\x0C\x0E-\x1F]")
 
-USER_AGENT = "Mozilla/5.0 (compatible; SansAnthologyBot/1.0; +https://san55.substack.com/)"
+# Mesmo User-Agent que o feedparser usa por padrão ao buscar URLs diretamente —
+# um User-Agent customizado levou o Substack a responder 403 Forbidden.
+USER_AGENT = getattr(feedparser, "USER_AGENT", "feedparser/6.0.11 +https://github.com/kurtmckee/feedparser/")
 
 
 # ---------------------------------------------------------------------------
@@ -132,10 +136,12 @@ def sanitize_xml_bytes(data):
 
 
 def fetch_feed(url):
-    """Busca o RSS manualmente e sanitiza o XML antes de repassar pro feedparser."""
-    response = requests.get(url, timeout=30, headers={"User-Agent": USER_AGENT})
-    response.raise_for_status()
-    return feedparser.parse(sanitize_xml_bytes(response.content))
+    """Busca o RSS manualmente (via urllib, como o próprio feedparser faz) e
+    sanitiza o XML antes de repassar pro feedparser."""
+    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    with urllib.request.urlopen(request, timeout=30) as response:
+        content = response.read()
+    return feedparser.parse(sanitize_xml_bytes(content))
 
 
 # ---------------------------------------------------------------------------
@@ -344,7 +350,7 @@ def main():
 
     try:
         feed = fetch_feed(SUBSTACK_RSS_URL)
-    except requests.RequestException as exc:
+    except (urllib.error.URLError, OSError) as exc:
         print(f"Erro ao buscar o feed RSS: {exc}", file=sys.stderr)
         sys.exit(1)
 
