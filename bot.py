@@ -420,20 +420,42 @@ def send_telegram_photo(chat_id, photo_url, caption, reply_markup=None):
     return response.json()
 
 
-def send_rich_article_message(chat_id, article_html, reply_to_message_id=None):
-    """Manda o artigo completo via sendRichMessage (Bot API 10.1+, rich
-    messages) — o corpo já vem sanitizado por rich_message.build_full_article_html.
-    Diferente das outras chamadas aqui, manda o corpo como JSON puro (em vez de
-    form-encoded): rich_message é um objeto aninhado, e o próprio Telegram
+def send_rich_message(chat_id, rich_html, reply_to_message_id=None, message_thread_id=None):
+    """Manda uma mensagem rica via sendRichMessage (Bot API 10.1+) — usada
+    tanto pro artigo completo (rich_message.build_full_article_html) quanto
+    pra persistir a resposta final de um chat que foi transmitido aos poucos
+    via sendRichMessageDraft (ver send_rich_message_draft/handle_chat_message).
+    Diferente das outras chamadas aqui, manda o corpo como JSON puro (em vez
+    de form-encoded): rich_message é um objeto aninhado, e o próprio Telegram
     aceita application/json no lugar de multipart pra métodos sem upload de
     arquivo — mais simples que serializar o objeto dentro de um campo de form."""
     url = TELEGRAM_API_BASE.format(token=TELEGRAM_BOT_TOKEN, method="sendRichMessage")
     payload = {
         "chat_id": chat_id,
-        "rich_message": {"html": article_html},
+        "rich_message": {"html": rich_html},
     }
     if reply_to_message_id is not None:
         payload["reply_parameters"] = {"message_id": reply_to_message_id}
+    if message_thread_id is not None:
+        payload["message_thread_id"] = message_thread_id
+    response = requests.post(url, json=payload, timeout=30)
+    response.raise_for_status()
+    return response.json()
+
+
+def send_rich_message_draft(chat_id, draft_id, rich_html, message_thread_id=None):
+    """Transmite uma versão parcial (ainda sendo gerada) de uma resposta via
+    sendRichMessageDraft. É efêmero — expira sozinho em 30s — por isso quem
+    chama isso PRECISA terminar com um send_rich_message pra persistir a
+    versão final (ver _stream_chat_reply). Só funciona em chat privado."""
+    url = TELEGRAM_API_BASE.format(token=TELEGRAM_BOT_TOKEN, method="sendRichMessageDraft")
+    payload = {
+        "chat_id": chat_id,
+        "draft_id": draft_id,
+        "rich_message": {"html": rich_html},
+    }
+    if message_thread_id is not None:
+        payload["message_thread_id"] = message_thread_id
     response = requests.post(url, json=payload, timeout=30)
     response.raise_for_status()
     return response.json()
@@ -568,6 +590,59 @@ def markdown_to_telegram_html(text):
 # Processamento de comandos recebidos (getUpdates)
 # ---------------------------------------------------------------------------
 
+def _send_chat_fallback_error(chat_id, message):
+    try:
+        send_telegram_message(
+            chat_id,
+            "😕 Não consegui responder agora, tenta de novo em alguns minutos.",
+            reply_to_message_id=message.get("message_id"),
+            message_thread_id=message.get("message_thread_id"),
+        )
+    except requests.RequestException:
+        pass
+
+
+# sendRichMessageDraft é efêmero (expira em 30s) e feito pra transmitir texto
+# sendo gerado aos poucos — mandar uma atualização a cada token seria
+# excessivo (rate limit da API, e o usuário nem percebe diferença). Só manda
+# uma atualização quando passar do intervalo mínimo E tiver texto novo
+# suficiente desde a última.
+STREAM_UPDATE_MIN_CHARS = 120
+STREAM_UPDATE_MIN_INTERVAL_SECONDS = 0.7
+
+
+def _stream_chat_reply(chat_id, question, previous_answer, draft_id, message_thread_id=None):
+    """Transmite a resposta do RAG aos poucos via sendRichMessageDraft
+    conforme o Claude gera o texto (só funciona em chat privado — daí ser
+    usada só nesse caso em handle_chat_message), e persiste a versão final
+    com sendRichMessage ao terminar, como a doc exige."""
+    last_sent_length = 0
+    last_sent_time = 0.0
+    final_text = ""
+
+    for accumulated in rag.answer_question_stream(question, previous_answer=previous_answer):
+        final_text = accumulated
+        now = time.monotonic()
+        has_enough_new_text = len(accumulated) - last_sent_length >= STREAM_UPDATE_MIN_CHARS
+        enough_time_passed = now - last_sent_time >= STREAM_UPDATE_MIN_INTERVAL_SECONDS
+        if not (has_enough_new_text and enough_time_passed):
+            continue
+        try:
+            send_rich_message_draft(chat_id, draft_id, markdown_to_telegram_html(accumulated), message_thread_id=message_thread_id)
+            last_sent_length = len(accumulated)
+            last_sent_time = now
+        except requests.RequestException as exc:
+            # uma atualização de draft falhar não é motivo pra abortar o
+            # streaming — a próxima tentativa (ou a mensagem final) resolve.
+            print(f"Falha ao atualizar rich message draft: {_error_detail(exc)}", file=sys.stderr)
+
+    final_text = truncate_summary(final_text, max_length=rich_message.ARTICLE_HTML_MAX_LENGTH)
+    send_rich_message(
+        chat_id, markdown_to_telegram_html(final_text),
+        reply_to_message_id=draft_id, message_thread_id=message_thread_id,
+    )
+
+
 def handle_chat_message(message, bot_id, bot_username):
     """Responde uma mensagem via RAG (chat sobre os artigos), se elegível
     pelas regras de privado/menção/reply. Erros não derrubam o processamento
@@ -586,19 +661,25 @@ def handle_chat_message(message, bot_id, bot_username):
     if reply_to and reply_to.get("from", {}).get("id") == bot_id:
         previous_answer = reply_to.get("text")
 
+    # sendRichMessageDraft só funciona em chat privado (ver doc do método);
+    # em grupo (menção/reply) mantemos o fluxo de sempre, sem streaming.
+    is_private = message.get("chat", {}).get("type", "private") == "private"
+    if is_private:
+        try:
+            _stream_chat_reply(
+                chat_id, question, previous_answer,
+                draft_id=message["message_id"], message_thread_id=message.get("message_thread_id"),
+            )
+        except Exception as exc:
+            print(f"Falha ao responder pergunta via RAG (streaming): {exc}", file=sys.stderr)
+            _send_chat_fallback_error(chat_id, message)
+        return
+
     try:
         answer = rag.answer_question(question, previous_answer=previous_answer)
     except Exception as exc:
         print(f"Falha ao responder pergunta via RAG: {exc}", file=sys.stderr)
-        try:
-            send_telegram_message(
-                chat_id,
-                "😕 Não consegui responder agora, tenta de novo em alguns minutos.",
-                reply_to_message_id=message.get("message_id"),
-                message_thread_id=message.get("message_thread_id"),
-            )
-        except requests.RequestException:
-            pass
+        _send_chat_fallback_error(chat_id, message)
         return
 
     answer = truncate_summary(answer, max_length=TELEGRAM_TEXT_MAX_LENGTH)
@@ -641,7 +722,7 @@ def handle_callback_query(callback_query):
 
     if article:
         try:
-            send_rich_article_message(chat_id, article["html"])
+            send_rich_message(chat_id, article["html"])
             answer_callback_query(callback_query["id"])
             return
         except requests.RequestException as exc:

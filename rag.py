@@ -111,22 +111,55 @@ def build_context(scored_chunks):
     return "\n\n---\n\n".join(blocks)
 
 
-def ask_claude(question, scored_chunks, previous_answer=None, client=None):
-    client = client or _anthropic_client()
-    system = SYSTEM_PROMPT.format(context=build_context(scored_chunks))
-
+def _build_messages(question, previous_answer):
     messages = []
     if previous_answer:
         messages.append({"role": "assistant", "content": previous_answer})
     messages.append({"role": "user", "content": question})
+    return messages
 
+
+def ask_claude(question, scored_chunks, previous_answer=None, client=None):
+    client = client or _anthropic_client()
+    system = SYSTEM_PROMPT.format(context=build_context(scored_chunks))
     response = client.messages.create(
         model=CLAUDE_MODEL,
         max_tokens=1024,
         system=system,
-        messages=messages,
+        messages=_build_messages(question, previous_answer),
     )
     return "".join(block.text for block in response.content if block.type == "text").strip()
+
+
+def stream_answer(question, scored_chunks, previous_answer=None, client=None):
+    """Como ask_claude, mas via streaming da API do Claude: cada yield é o
+    texto acumulado da resposta até aquele ponto (não só o pedaço novo),
+    pensado pra alimentar atualizações de sendRichMessageDraft em bot.py."""
+    client = client or _anthropic_client()
+    system = SYSTEM_PROMPT.format(context=build_context(scored_chunks))
+
+    accumulated = ""
+    with client.messages.stream(
+        model=CLAUDE_MODEL,
+        max_tokens=1024,
+        system=system,
+        messages=_build_messages(question, previous_answer),
+    ) as stream:
+        for delta in stream.text_stream:
+            accumulated += delta
+            yield accumulated
+
+
+def _relevant_chunks_or_none(question, index, voyage_client=None):
+    """Busca os chunks mais relevantes pra pergunta contra o índice; retorna
+    None se a melhor similaridade ficar abaixo de LIMIAR_RELEVANCIA (recusa
+    sem gastar uma chamada à API do Claude)."""
+    query_embedding = embed_query(question, client=voyage_client)
+    scored_chunks = search(query_embedding, index)
+    best_score = scored_chunks[0][0] if scored_chunks else 0.0
+    if best_score < LIMIAR_RELEVANCIA:
+        return None
+    return scored_chunks
 
 
 def answer_question(question, index=None, previous_answer=None, voyage_client=None, anthropic_client=None):
@@ -136,14 +169,31 @@ def answer_question(question, index=None, previous_answer=None, voyage_client=No
     if not index:
         return REFUSAL_MESSAGE
 
-    query_embedding = embed_query(question, client=voyage_client)
-    scored_chunks = search(query_embedding, index)
-
-    best_score = scored_chunks[0][0] if scored_chunks else 0.0
-    if best_score < LIMIAR_RELEVANCIA:
+    scored_chunks = _relevant_chunks_or_none(question, index, voyage_client)
+    if scored_chunks is None:
         return REFUSAL_MESSAGE
 
     return ask_claude(question, scored_chunks, previous_answer=previous_answer, client=anthropic_client)
+
+
+def answer_question_stream(question, index=None, previous_answer=None, voyage_client=None, anthropic_client=None):
+    """Como answer_question, mas via generator: pra perguntas elegíveis (o
+    guardrail de relevância passou), cada yield é o texto acumulado da
+    resposta até aquele ponto, conforme o Claude vai gerando. Uma recusa
+    (sem índice, ou pergunta fora do escopo) produz um único yield com
+    REFUSAL_MESSAGE, sem streaming de verdade — não há o que transmitir aos
+    poucos numa resposta fixa."""
+    index = load_articles_index() if index is None else index
+    if not index:
+        yield REFUSAL_MESSAGE
+        return
+
+    scored_chunks = _relevant_chunks_or_none(question, index, voyage_client)
+    if scored_chunks is None:
+        yield REFUSAL_MESSAGE
+        return
+
+    yield from stream_answer(question, scored_chunks, previous_answer=previous_answer, client=anthropic_client)
 
 
 # ---------------------------------------------------------------------------

@@ -15,6 +15,7 @@ from unittest.mock import Mock, patch
 import requests
 
 import bot
+import rich_message
 
 
 class FakeEntry(dict):
@@ -268,40 +269,48 @@ class CommandMessageBuildersTest(unittest.TestCase):
 
 class ProcessUpdatesTest(unittest.TestCase):
     def _run(self, updates, initial_subscribers=None, should_respond=False, rag_answer="resposta"):
+        """Chat privado (o caso comum nesses testes) passa pelo caminho de
+        streaming — rag.answer_question_stream + sendRichMessageDraft/
+        sendRichMessage — então mocka os dois lados: o antigo (send_telegram_message,
+        pra comandos e pro caminho de grupo sem streaming) e o novo (send_rich_message)."""
         with patch.object(bot, "SUBSCRIBERS_FILE", Path("test_subscribers_tmp.json")), \
              patch.object(bot, "OFFSET_FILE", Path("test_offset_tmp.json")), \
              patch.object(bot, "get_updates", return_value=updates), \
              patch.object(bot, "get_me", return_value=(999, "meubot")), \
              patch.object(bot.rag, "should_respond", return_value=should_respond), \
              patch.object(bot.rag, "answer_question", return_value=rag_answer), \
+             patch.object(bot.rag, "answer_question_stream", return_value=iter([rag_answer])), \
+             patch.object(bot, "send_rich_message_draft"), \
+             patch.object(bot, "send_rich_message") as mock_send_rich, \
              patch.object(bot, "send_telegram_message") as mock_send:
             try:
                 if initial_subscribers is not None:
                     bot.save_subscribers(initial_subscribers)
                 bot.process_updates([])
-                return mock_send, bot.load_subscribers()
+                return mock_send, mock_send_rich, bot.load_subscribers()
             finally:
                 bot.SUBSCRIBERS_FILE.unlink(missing_ok=True)
                 bot.OFFSET_FILE.unlink(missing_ok=True)
 
     def test_start_command_subscribes_user(self):
         updates = [{"update_id": 1, "message": {"chat": {"id": 111}, "text": "/start"}}]
-        mock_send, subscribers = self._run(updates)
+        mock_send, _, subscribers = self._run(updates)
         self.assertEqual(subscribers, {111})
         mock_send.assert_called_once()
         self.assertEqual(mock_send.call_args[0][0], 111)
 
     def test_stop_command_unsubscribes_user(self):
         updates = [{"update_id": 2, "message": {"chat": {"id": 111}, "text": "/stop"}}]
-        mock_send, subscribers = self._run(updates, initial_subscribers={111})
+        mock_send, _, subscribers = self._run(updates, initial_subscribers={111})
         self.assertEqual(subscribers, set())
         mock_send.assert_called_once()
 
     def test_unknown_text_does_not_subscribe_or_reply_when_not_eligible_for_chat(self):
         updates = [{"update_id": 3, "message": {"chat": {"id": 999}, "text": "oi tudo bem?"}}]
-        mock_send, subscribers = self._run(updates, should_respond=False)
+        mock_send, mock_send_rich, subscribers = self._run(updates, should_respond=False)
         self.assertEqual(subscribers, set())
         mock_send.assert_not_called()
+        mock_send_rich.assert_not_called()
 
     def test_dispatches_eligible_message_to_rag_and_replies(self):
         updates = [{
@@ -312,9 +321,9 @@ class ProcessUpdatesTest(unittest.TestCase):
                 "text": "qual o tema do blog?",
             },
         }]
-        mock_send, _ = self._run(updates, should_respond=True, rag_answer="Resposta gerada.")
-        mock_send.assert_called_once()
-        args, kwargs = mock_send.call_args
+        _, mock_send_rich, _ = self._run(updates, should_respond=True, rag_answer="Resposta gerada.")
+        mock_send_rich.assert_called_once()
+        args, kwargs = mock_send_rich.call_args
         self.assertEqual(args[0], 555)
         self.assertIn("Resposta gerada.", args[1])
         self.assertEqual(kwargs.get("reply_to_message_id"), 42)
@@ -324,8 +333,8 @@ class ProcessUpdatesTest(unittest.TestCase):
             "update_id": 4,
             "message": {"message_id": 42, "chat": {"id": 555, "type": "private"}, "text": "pergunta"},
         }]
-        mock_send, _ = self._run(updates, should_respond=True, rag_answer="Menos que <isso> & mais.")
-        args, _ = mock_send.call_args
+        _, mock_send_rich, _ = self._run(updates, should_respond=True, rag_answer="Menos que <isso> & mais.")
+        args, _ = mock_send_rich.call_args
         self.assertIn("&lt;isso&gt;", args[1])
         self.assertIn("&amp;", args[1])
 
@@ -334,25 +343,40 @@ class ProcessUpdatesTest(unittest.TestCase):
             "update_id": 4,
             "message": {"message_id": 42, "chat": {"id": 555, "type": "private"}, "text": "pergunta"},
         }]
-        mock_send, _ = self._run(
+        _, mock_send_rich, _ = self._run(
             updates, should_respond=True,
             rag_answer="**Título**\n\nUm ponto em *itálico* e `código`.",
         )
-        args, _ = mock_send.call_args
+        args, _ = mock_send_rich.call_args
         self.assertIn("<b>Título</b>", args[1])
         self.assertIn("<i>itálico</i>", args[1])
         self.assertIn("<code>código</code>", args[1])
         self.assertNotIn("**", args[1])
 
     def test_long_rag_answer_is_truncated_before_sending(self):
+        # Chat em grupo (não privado) continua no caminho antigo, sem
+        # streaming — sendMessage direto com o limite de TELEGRAM_TEXT_MAX_LENGTH.
         long_answer = "palavra " * 1000  # bem acima do limite de envio do Telegram
+        updates = [{
+            "update_id": 4,
+            "message": {"message_id": 42, "chat": {"id": 555, "type": "group"}, "text": "@meubot pergunta"},
+        }]
+        mock_send, _, _ = self._run(updates, should_respond=True, rag_answer=long_answer)
+        args, _ = mock_send.call_args
+        self.assertLessEqual(len(args[1]), bot.TELEGRAM_TEXT_MAX_LENGTH + 10)
+        self.assertTrue(args[1].endswith("..."))
+
+    def test_long_rag_answer_is_truncated_in_streaming_path(self):
+        # Chat privado: streaming usa o limite bem maior do rich message
+        # (32.000 caracteres), não o TELEGRAM_TEXT_MAX_LENGTH do sendMessage.
+        long_answer = "palavra " * 5000
         updates = [{
             "update_id": 4,
             "message": {"message_id": 42, "chat": {"id": 555, "type": "private"}, "text": "pergunta"},
         }]
-        mock_send, _ = self._run(updates, should_respond=True, rag_answer=long_answer)
-        args, _ = mock_send.call_args
-        self.assertLessEqual(len(args[1]), bot.TELEGRAM_TEXT_MAX_LENGTH + 10)
+        _, mock_send_rich, _ = self._run(updates, should_respond=True, rag_answer=long_answer)
+        args, _ = mock_send_rich.call_args
+        self.assertLessEqual(len(args[1]), rich_message.ARTICLE_HTML_MAX_LENGTH + 10)
         self.assertTrue(args[1].endswith("..."))
 
     def test_send_failure_after_rag_answer_does_not_crash(self):
@@ -365,8 +389,9 @@ class ProcessUpdatesTest(unittest.TestCase):
              patch.object(bot, "get_updates", return_value=updates), \
              patch.object(bot, "get_me", return_value=(999, "meubot")), \
              patch.object(bot.rag, "should_respond", return_value=True), \
-             patch.object(bot.rag, "answer_question", return_value="resposta"), \
-             patch.object(bot, "send_telegram_message", side_effect=requests.HTTPError("400 Client Error")):
+             patch.object(bot.rag, "answer_question_stream", return_value=iter(["resposta"])), \
+             patch.object(bot, "send_rich_message", side_effect=requests.HTTPError("400 Client Error")), \
+             patch.object(bot, "send_telegram_message"):
             try:
                 bot.process_updates([])
             finally:
@@ -383,7 +408,7 @@ class ProcessUpdatesTest(unittest.TestCase):
              patch.object(bot, "get_updates", return_value=updates), \
              patch.object(bot, "get_me", return_value=(999, "meubot")), \
              patch.object(bot.rag, "should_respond", return_value=True), \
-             patch.object(bot.rag, "answer_question", side_effect=Exception("boom")), \
+             patch.object(bot.rag, "answer_question_stream", side_effect=Exception("boom")), \
              patch.object(bot, "send_telegram_message") as mock_send:
             try:
                 bot.process_updates([])
@@ -420,7 +445,7 @@ class HandleCallbackQueryTest(unittest.TestCase):
 
     def test_sends_rich_article_and_answers_callback_on_success(self):
         with patch.object(bot, "ARTICLE_CONTENT_FILE", Path("test_article_content_tmp.json")), \
-             patch.object(bot, "send_rich_article_message") as mock_rich, \
+             patch.object(bot, "send_rich_message") as mock_rich, \
              patch.object(bot, "answer_callback_query") as mock_answer:
             try:
                 bot.save_article_content({"abc123": {"html": "<h1>Título</h1>", "link": "https://x.com/p/a"}})
@@ -432,7 +457,7 @@ class HandleCallbackQueryTest(unittest.TestCase):
 
     def test_falls_back_to_link_message_when_rich_send_fails(self):
         with patch.object(bot, "ARTICLE_CONTENT_FILE", Path("test_article_content_tmp.json")), \
-             patch.object(bot, "send_rich_article_message", side_effect=requests.HTTPError("400 Client Error")), \
+             patch.object(bot, "send_rich_message", side_effect=requests.HTTPError("400 Client Error")), \
              patch.object(bot, "send_telegram_message") as mock_send, \
              patch.object(bot, "answer_callback_query") as mock_answer:
             try:
@@ -447,7 +472,7 @@ class HandleCallbackQueryTest(unittest.TestCase):
 
     def test_answers_with_alert_when_short_id_unknown(self):
         with patch.object(bot, "ARTICLE_CONTENT_FILE", Path("test_article_content_tmp.json")), \
-             patch.object(bot, "send_rich_article_message") as mock_rich, \
+             patch.object(bot, "send_rich_message") as mock_rich, \
              patch.object(bot, "answer_callback_query") as mock_answer:
             try:
                 bot.handle_callback_query(self._callback("art:nao-existe"))
@@ -458,7 +483,7 @@ class HandleCallbackQueryTest(unittest.TestCase):
         self.assertTrue(mock_answer.call_args.kwargs.get("show_alert"))
 
     def test_ignores_unrelated_callback_data(self):
-        with patch.object(bot, "send_rich_article_message") as mock_rich, \
+        with patch.object(bot, "send_rich_message") as mock_rich, \
              patch.object(bot, "answer_callback_query") as mock_answer:
             bot.handle_callback_query(self._callback("outra_coisa"))
         mock_rich.assert_not_called()

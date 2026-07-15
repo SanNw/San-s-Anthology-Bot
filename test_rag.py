@@ -152,5 +152,55 @@ class AnswerQuestionTest(unittest.TestCase):
         fake_voyage.embed.assert_not_called()
 
 
+class _FakeStreamContext:
+    """Simula o context manager que client.messages.stream() devolve de
+    verdade na SDK da Anthropic: .text_stream itera os pedaços de texto."""
+
+    def __init__(self, chunks):
+        self._chunks = chunks
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+    @property
+    def text_stream(self):
+        return iter(self._chunks)
+
+
+class AnswerQuestionStreamTest(unittest.TestCase):
+    def test_yields_accumulated_text_as_it_streams(self):
+        index = [{"id": "a", "texto": "sobre filosofia", "url": "u", "titulo": "t", "embedding": [1, 0]}]
+        fake_voyage = MagicMock()
+        fake_voyage.embed.return_value = MagicMock(embeddings=[[1, 0]])  # idêntico -> score 1
+        fake_anthropic = MagicMock()
+        fake_anthropic.messages.stream.return_value = _FakeStreamContext(["Olá", ", tudo", " bem?"])
+
+        chunks = list(rag.answer_question_stream(
+            "pergunta dentro do tema", index=index, voyage_client=fake_voyage, anthropic_client=fake_anthropic,
+        ))
+
+        self.assertEqual(chunks, ["Olá", "Olá, tudo", "Olá, tudo bem?"])
+
+    def test_refuses_without_streaming_when_below_threshold(self):
+        index = [{"id": "a", "texto": "sobre filosofia", "url": "u", "titulo": "t", "embedding": [1, 0]}]
+        fake_voyage = MagicMock()
+        fake_voyage.embed.return_value = MagicMock(embeddings=[[0, 1]])  # ortogonal -> score 0
+        fake_anthropic = MagicMock()
+
+        chunks = list(rag.answer_question_stream(
+            "pergunta bem fora do tema", index=index, voyage_client=fake_voyage, anthropic_client=fake_anthropic,
+        ))
+
+        self.assertEqual(chunks, [rag.REFUSAL_MESSAGE])
+        fake_anthropic.messages.stream.assert_not_called()
+
+    def test_refuses_when_index_is_empty(self):
+        chunks = list(rag.answer_question_stream("qualquer pergunta", index=[]))
+        self.assertEqual(chunks, [rag.REFUSAL_MESSAGE])
+
+
 if __name__ == "__main__":
     unittest.main()
