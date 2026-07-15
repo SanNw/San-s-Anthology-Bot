@@ -2,11 +2,15 @@ name: Publicar artigos do Substack no Telegram
 
 on:
   schedule:
-    - cron: "*/10 * * * *"
+    - cron: "*/5 * * * *"
   workflow_dispatch: {}
 
 permissions:
   contents: write
+
+concurrency:
+  group: telegram-substack-bot
+  cancel-in-progress: false
 
 jobs:
   publish:
@@ -28,6 +32,8 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
           SUBSTACK_RSS_URL: ${{ secrets.SUBSTACK_RSS_URL }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          VOYAGE_API_KEY: ${{ secrets.VOYAGE_API_KEY }}
         run: python bot.py
 
       - name: Commit e push do estado (posted.json, subscribers.json, update_offset.json)
