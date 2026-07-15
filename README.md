@@ -30,7 +30,7 @@ Além dos comandos, o bot responde perguntas com base **exclusivamente** no cont
 | `/substack` | Envia o link para assinar o Substack |
 | `/sugestao` | Avisa que sugestões de assunto podem ser mandadas diretamente numa mensagem |
 
-Como o bot roda via GitHub Actions (sem servidor 24/7), os comandos e as respostas do chat são processados a cada execução do workflow — não instantaneamente. O cron está configurado para rodar a cada 5 minutos.
+O bot roda como um processo contínuo (Background Worker no Render) e fica em long polling com o Telegram — comandos e respostas do chat chegam quase instantaneamente. O feed RSS é reconsultado a cada `FEED_CHECK_INTERVAL_SECONDS` (padrão 300s = 5 min; veja a seção "Fazer deploy no Render").
 
 ## 1. Criar o bot no @BotFather
 
@@ -90,7 +90,7 @@ pip install -r requirements.txt
 python bot.py
 ```
 
-Na primeira execução, todos os artigos do feed são considerados "novos" e publicados (do mais antigo pro mais novo). As próximas execuções só publicam o que ainda não estiver em `posted.json`.
+`python bot.py` roda em loop contínuo (o mesmo processo que sobe no Render) — pare com Ctrl+C. Na primeira execução, todos os artigos do feed são considerados "novos" e publicados (do mais antigo pro mais novo). As próximas execuções só publicam o que ainda não estiver em `posted.json`. Localmente os arquivos de estado ficam na raiz do projeto; em produção, a env var `DATA_DIR` aponta pro Disk persistente do Render (veja a seção "Fazer deploy no Render").
 
 Para rodar os testes:
 
@@ -118,35 +118,49 @@ Pra ajustar o quão exigente o bot é antes de recusar uma pergunta por falta de
 
 Depois de gerar/atualizar o `articles_index.json`, **commite o arquivo** — ele precisa estar no repositório pra o bot rodando no GitHub Actions conseguir usá-lo.
 
-## 6. Configurar o GitHub Actions
+## 6. Fazer deploy no Render (Web Service free + webhook)
 
-O workflow em `.github/workflows/telegram-substack.yml` roda o bot a cada 5 minutos (`cron: "*/5 * * * *"`) e também pode ser disparado manualmente pela aba **Actions** do repositório (`workflow_dispatch`). Tem um `concurrency group` configurado pra nunca rodar duas execuções em paralelo (evita corrida no `getUpdates` do Telegram e conflito de commit nos arquivos de estado).
+O bot roda no plano **free** do Render como **Web Service**, no modo **webhook**: em vez de ficar perguntando ao Telegram por mensagens novas (long polling), o Telegram empurra cada mensagem via HTTP `POST` direto pro bot. Isso existe especificamente por causa das limitações do plano free:
 
-Para funcionar, cadastre os cinco Secrets no repositório:
+- Web Service free **dorme depois de ~15 min sem tráfego HTTP** e não tem Disk persistente. Um Background Worker (processo sempre ligado, com long polling e Disk) seria o desenho mais simples, mas não tem tier gratuito no Render.
+- Pra compensar, um serviço externo e gratuito (ex: [cron-job.org](https://cron-job.org) ou [UptimeRobot](https://uptimerobot.com)) precisa bater periodicamente (a cada ~10 min) num endpoint HTTP do bot — isso mantém o serviço acordado. Esse mesmo "ping" é aproveitado internamente pra checar o feed RSS e sincronizar o estado com o GitHub (veja abaixo), então **a frequência do ping define a latência de publicação de artigos novos** — pings a cada 10 min ≈ artigos novos aparecem em até ~10 min.
+- Sem Disk, `posted.json`, `subscribers.json` e `update_offset.json` não sobrevivem a um redeploy/reinício se ficassem só no disco efêmero do container. Por isso o bot **commita e dá push desses três arquivos de volta pro GitHub** periodicamente (`GITHUB_TOKEN`, veja o passo 4) — é a mesma ideia que o workflow do GitHub Actions já fazia, só que disparada pelo processo em vez de pelo Actions.
 
-1. No GitHub, vá em **Settings → Secrets and variables → Actions → New repository secret**.
-2. Crie:
+Se no futuro você migrar para um plano pago, o worker com long polling + Disk (sem depender de ping externo nem de commitar estado no Git) é a opção mais simples e robusta — peça pra eu voltar a montar esse desenho.
+
+O repositório já inclui um `render.yaml` (Blueprint) com a configuração pronta. Passo a passo:
+
+1. **Gere um GitHub Personal Access Token** com permissão de escrita neste repositório: [github.com/settings/tokens](https://github.com/settings/tokens) → **Fine-grained tokens** → selecione só este repositório → permissão **Contents: Read and write**. Trate como uma senha (mesmas regras dos outros secrets).
+2. No [dashboard do Render](https://dashboard.render.com), **New → Blueprint** e aponte para este repositório (ele detecta o `render.yaml` automaticamente). Ou crie manualmente um **New → Web Service** apontando pro repo, com Build Command `pip install -r requirements.txt`, Start Command `python bot.py` e plano **Free**.
+3. Em **Environment**, cadastre os seis secrets (o Blueprint já declara as chaves com `sync: false`, então o Render vai pedir os valores na primeira vez):
    - `TELEGRAM_BOT_TOKEN` (gerado pelo @BotFather)
    - `TELEGRAM_CHANNEL_ID` (veja a seção 2 acima)
    - `SUBSTACK_RSS_URL` → `https://san55.substack.com/feed`
    - `ANTHROPIC_API_KEY` (console.anthropic.com) — usada pelo chat/RAG
    - `VOYAGE_API_KEY` (dash.voyageai.com) — usada pelo chat/RAG para embeddings de busca
+   - `GITHUB_TOKEN` — o token do passo 1, usado só pra commitar de volta os arquivos de estado
+4. Opcional (recomendado): defina `TELEGRAM_WEBHOOK_SECRET` com um valor aleatório — o bot passa isso pro Telegram ao registrar o webhook e rejeita qualquer `POST` que não venha com esse mesmo segredo no header, evitando que outra pessoa forje mensagens pro seu bot.
+5. Opcional: ajuste `FEED_CHECK_INTERVAL_SECONDS` (padrão `300`) e `STATE_SYNC_INTERVAL_SECONDS` (padrão `60`) como env vars se quiser mudar a frequência de checagem do feed ou do commit de estado.
+6. Faça o deploy. O Render vai te dar uma URL pública (`https://algo.onrender.com`) — ela já é usada automaticamente pelo bot pra se registrar como webhook no Telegram (via a env var `RENDER_EXTERNAL_URL`, que o Render define sozinho).
+7. Configure o keep-alive: em [cron-job.org](https://cron-job.org) (ou similar), crie uma tarefa que faça `GET` na URL do serviço a cada 5–10 minutos.
 
-O workflow já está configurado com `permissions: contents: write` para poder commitar de volta no repositório, após cada execução, os arquivos de estado (`posted.json`, `subscribers.json`, `update_offset.json`) — isso mantém o histórico de artigos publicados, a lista de assinantes e o progresso do processamento de comandos entre uma execução e outra.
+> Importante: rode o bot em **um único lugar por vez**. Rodar local (`python bot.py`, modo polling) ao mesmo tempo que o webhook no Render está ativo faz o Telegram brigar sobre pra onde mandar as mensagens. O workflow antigo do GitHub Actions (`.github/workflows/telegram-substack.yml`) foi removido deste repositório por esse motivo.
+
+Depois de gerar/atualizar o `articles_index.json` localmente (seção 5), **commite e faça push** — o Render reconstrói a partir do repositório a cada deploy, então o índice precisa estar versionado pra o chat/RAG funcionar em produção.
 
 ## Estrutura do projeto
 
 ```
-bot.py                                  # script principal: publica artigos, comandos e dispatch do chat/RAG
-rag.py                                  # busca por similaridade, guardrail de escopo e chamada à API do Claude
-index_articles.py                       # indexação (sob demanda) do texto completo dos artigos pro RAG
-test_bot.py                             # testes das funções de parsing, comandos e dispatch de chat
-test_rag.py                             # testes de chunking, similaridade de cosseno e guardrail do RAG
-requirements.txt                        # dependências (feedparser, requests, python-dotenv, anthropic, voyageai, numpy)
-.env.example                            # modelo das variáveis de ambiente
-posted.json                             # artigos já publicados (ignorado no git local, commitado pelo Actions)
-subscribers.json                        # chat_ids inscritos para receber artigos no privado (idem)
-update_offset.json                      # último update_id do Telegram já processado (idem)
-articles_index.json                     # chunks + embeddings dos artigos, gerado por index_articles.py (versionado)
-.github/workflows/telegram-substack.yml # automação via GitHub Actions (a cada 5 min)
+bot.py                    # script principal: modo webhook (Render) ou polling (local), publica artigos, comandos e dispatch do chat/RAG
+rag.py                    # busca por similaridade, guardrail de escopo e chamada à API do Claude
+index_articles.py         # indexação (sob demanda) do texto completo dos artigos pro RAG
+test_bot.py                # testes das funções de parsing, comandos, dispatch de chat e do servidor webhook
+test_rag.py                # testes de chunking, similaridade de cosseno e guardrail do RAG
+requirements.txt           # dependências (feedparser, requests, python-dotenv, anthropic, voyageai, numpy)
+.env.example                # modelo das variáveis de ambiente
+render.yaml                 # Blueprint do Render (Web Service free)
+posted.json                 # artigos já publicados (versionado; o bot commita as mudanças em produção)
+subscribers.json            # chat_ids inscritos para receber artigos no privado (idem)
+update_offset.json          # só usado no modo polling local; irrelevante no webhook (idem)
+articles_index.json         # chunks + embeddings dos artigos, gerado por index_articles.py (versionado)
 ```
